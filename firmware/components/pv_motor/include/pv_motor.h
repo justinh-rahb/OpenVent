@@ -39,3 +39,6 @@ pv_motor_hall_t pv_motor_hall(int group);
 
 // True while a group is actively driving toward its target.
 bool pv_motor_is_running(int group);
+
+// Active group count (0/2/4), as passed to pv_motor_init.
+int pv_motor_active_groups(void);

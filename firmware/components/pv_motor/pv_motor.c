@@ -330,3 +330,5 @@ bool pv_motor_is_running(int group)
     if (group < 0 || group >= s_active_groups) return false;
     return s_groups[group].running;
 }
+
+int pv_motor_active_groups(void) { return s_active_groups; }
