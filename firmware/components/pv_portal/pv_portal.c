@@ -199,7 +199,8 @@ static esp_err_t send_wifi_section(httpd_req_t *req)
     for (int i = 0; i < n; ++i) {
         char ssid_esc[80];
         html_escape((const char *)recs[i].ssid, ssid_esc, sizeof(ssid_esc));
-        char row[160];
+        // Two escaped SSIDs + fixed template, worst case ~200 bytes.
+        char row[256];
         snprintf(row, sizeof(row),
             "<option value=\"%s\">%s (%d dBm%s)</option>",
             ssid_esc, ssid_esc,
@@ -301,8 +302,10 @@ static esp_err_t send_ap_section(httpd_req_t *req)
         "<button>Save AP &amp; reboot</button>"
         "</form>",
         ssid_esc, pass_esc,
-        (ap.ip >> 24) & 0xFF, (ap.ip >> 16) & 0xFF,
-        (ap.ip >> 8)  & 0xFF,  ap.ip        & 0xFF);
+        (unsigned)((ap.ip >> 24) & 0xFF),
+        (unsigned)((ap.ip >> 16) & 0xFF),
+        (unsigned)((ap.ip >>  8) & 0xFF),
+        (unsigned)( ap.ip        & 0xFF));
     return SEND(req, buf);
 }
 

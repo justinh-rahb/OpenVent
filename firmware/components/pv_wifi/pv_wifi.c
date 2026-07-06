@@ -178,10 +178,14 @@ static void start_ap_mode(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     s_state = PV_WIFI_STATE_AP_PORTAL;
+    // uint32_t is 'long unsigned' under IDF 5.3's toolchain — cast per octet
+    // so %u picks up plain unsigned int.
     ESP_LOGI(TAG, "AP SSID=%s ip=%u.%u.%u.%u",
              ap.ap.ssid,
-             (cfg.ip >> 24) & 0xFF, (cfg.ip >> 16) & 0xFF,
-             (cfg.ip >> 8) & 0xFF,  cfg.ip & 0xFF);
+             (unsigned)((cfg.ip >> 24) & 0xFF),
+             (unsigned)((cfg.ip >> 16) & 0xFF),
+             (unsigned)((cfg.ip >>  8) & 0xFF),
+             (unsigned)( cfg.ip        & 0xFF));
     // Portal is started by app_main after pv_wifi_start returns.
 }
 
