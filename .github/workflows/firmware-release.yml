@@ -41,17 +41,60 @@ jobs:
           cp firmware/build/bootloader/bootloader.bin dist/
           cp firmware/build/partition_table/partition-table.bin dist/
           cp firmware/build/ota_data_initial.bin dist/
-          cp firmware/build/flasher_args.json dist/
-          cp firmware/build/flash_args dist/
+
+          cat > dist/flash_args <<'EOF'
+          --flash_mode dio --flash_freq 40m --flash_size 4MB
+          0x1000 bootloader.bin
+          0x8000 partition-table.bin
+          0xf000 ota_data_initial.bin
+          0x20000 pandavent_klipper.bin
+          EOF
+
+          cat > dist/flasher_args.json <<'EOF'
+          {
+            "write_flash_args": ["--flash_mode", "dio", "--flash_size", "4MB", "--flash_freq", "40m"],
+            "flash_settings": {
+              "flash_mode": "dio",
+              "flash_size": "4MB",
+              "flash_freq": "40m"
+            },
+            "flash_files": {
+              "0x1000": "bootloader.bin",
+              "0x8000": "partition-table.bin",
+              "0xf000": "ota_data_initial.bin",
+              "0x20000": "pandavent_klipper.bin"
+            },
+            "bootloader": { "offset": "0x1000", "file": "bootloader.bin", "encrypted": "false" },
+            "partition-table": { "offset": "0x8000", "file": "partition-table.bin", "encrypted": "false" },
+            "otadata": { "offset": "0xf000", "file": "ota_data_initial.bin", "encrypted": "false" },
+            "app": { "offset": "0x20000", "file": "pandavent_klipper.bin", "encrypted": "false" },
+            "extra_esptool_args": {
+              "after": "hard_reset",
+              "before": "default_reset",
+              "stub": true,
+              "chip": "esp32"
+            }
+          }
+          EOF
 
           cat > dist/FLASHING.txt <<'EOF'
-          Flash from the firmware/ directory with:
+          If you downloaded a GitHub Actions artifact, unzip it first:
 
-            idf.py -p PORT flash
+            unzip pandavent-klipper-*.zip
+            cd pandavent-klipper-*
 
-          Or flash the release artifacts manually with:
+          Install esptool if needed:
 
-            python -m esptool --chip esp32 -b 460800 --before default_reset --after hard_reset \
+            python -m pip install esptool
+
+          Put the ESP32 in bootloader mode, then flash with:
+
+            python -m esptool --chip esp32 -p PORT -b 460800 \
+              --before default_reset --after hard_reset write_flash @flash_args
+
+          Or run the equivalent explicit command:
+
+            python -m esptool --chip esp32 -p PORT -b 460800 --before default_reset --after hard_reset \
               write_flash --flash_mode dio --flash_size 4MB --flash_freq 40m \
               0x1000 bootloader.bin \
               0x8000 partition-table.bin \
