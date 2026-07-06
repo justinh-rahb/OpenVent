@@ -1,0 +1,3 @@
+[submodule "vendor/Panda-Vent"]
+	path = vendor/Panda-Vent
+	url = https://github.com/bigtreetech/Panda-Vent.git
