@@ -8,22 +8,30 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "mdns.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "lwip/inet.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "pv_wifi";
 
-#define NVS_NS   "app_nvs"       // matches stock firmware
-#define KEY_SSID "ssid"
-#define KEY_PASS "password"
+#define NVS_NS      "app_nvs"    // matches stock firmware
+#define KEY_SSID    "ssid"
+#define KEY_PASS    "password"
+#define KEY_AP_SSID "ap_ssid"
+#define KEY_AP_PASS "ap_pass"
+#define KEY_AP_IP   "ap_ip"
 
 #define STA_MAX_RETRIES  5
 #define BIT_CONNECTED    BIT0
 #define BIT_FAILED       BIT1
+
+#define DEFAULT_AP_IP  0xC0A80401U   // 192.168.4.1
 
 static pv_wifi_state_t s_state = PV_WIFI_STATE_INIT;
 static EventGroupHandle_t s_events = NULL;
@@ -31,6 +39,13 @@ static esp_netif_t *s_sta_netif = NULL;
 static esp_netif_t *s_ap_netif = NULL;
 static int s_retry = 0;
 static bool s_mdns_started = false;
+
+// Scan cache — mutex-protected because on_wifi_event fires on the WiFi task
+// but pv_wifi_get_scan_results is called from the httpd task.
+static SemaphoreHandle_t s_scan_lock = NULL;
+static wifi_ap_record_t s_scan_cache[PV_WIFI_SCAN_MAX];
+static int              s_scan_count = 0;
+static bool             s_scanning   = false;
 
 static esp_err_t start_mdns(void)
 {
@@ -88,11 +103,53 @@ static bool load_saved_creds(char *ssid, size_t ssid_sz, char *pass, size_t pass
 
 // ---------- AP mode ----------
 
-static void build_ap_ssid(char *out, size_t out_sz)
+static void build_default_ap_ssid(char *out, size_t out_sz)
 {
     uint8_t mac[6];
     esp_wifi_get_mac(WIFI_IF_AP, mac);
     snprintf(out, out_sz, "%s%02X%02X", PV_WIFI_AP_SSID_PREFIX, mac[4], mac[5]);
+}
+
+// Populate `out` with the effective AP config: NVS values if set, defaults
+// otherwise (MAC-derived SSID, hardcoded password, 192.168.4.1).
+static void load_ap_config(pv_wifi_ap_config_t *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    if (nvs_read_str(KEY_AP_SSID, out->ssid, sizeof(out->ssid)) != ESP_OK ||
+        out->ssid[0] == '\0') {
+        build_default_ap_ssid(out->ssid, sizeof(out->ssid));
+    }
+    if (nvs_read_str(KEY_AP_PASS, out->password, sizeof(out->password)) != ESP_OK ||
+        out->password[0] == '\0') {
+        strncpy(out->password, PV_WIFI_AP_PASSWORD, sizeof(out->password) - 1);
+    }
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        uint32_t ip = 0;
+        if (nvs_get_u32(h, KEY_AP_IP, &ip) != ESP_OK || ip == 0) ip = DEFAULT_AP_IP;
+        out->ip = ip;
+        nvs_close(h);
+    } else {
+        out->ip = DEFAULT_AP_IP;
+    }
+}
+
+// Reassign the AP netif's IP + DHCP pool. Must happen while the AP is down.
+static esp_err_t apply_ap_ip(uint32_t ip_host_order)
+{
+    if (s_ap_netif == NULL) return ESP_ERR_INVALID_STATE;
+    ESP_ERROR_CHECK(esp_netif_dhcps_stop(s_ap_netif));
+
+    esp_netif_ip_info_t info = {
+        .ip.addr      = htonl(ip_host_order),
+        .netmask.addr = htonl(0xFFFFFF00U),   // /24
+        .gw.addr      = htonl(ip_host_order),
+    };
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(s_ap_netif, &info));
+    ESP_ERROR_CHECK(esp_netif_dhcps_start(s_ap_netif));
+    return ESP_OK;
 }
 
 static void start_ap_mode(void)
@@ -100,20 +157,31 @@ static void start_ap_mode(void)
     ESP_LOGI(TAG, "starting AP + captive portal");
     ESP_ERROR_CHECK(esp_wifi_stop());
 
+    pv_wifi_ap_config_t cfg;
+    load_ap_config(&cfg);
+    apply_ap_ip(cfg.ip);
+
     wifi_config_t ap = {0};
-    build_ap_ssid((char *)ap.ap.ssid, sizeof(ap.ap.ssid));
-    strncpy((char *)ap.ap.password, PV_WIFI_AP_PASSWORD, sizeof(ap.ap.password) - 1);
+    strncpy((char *)ap.ap.ssid,     cfg.ssid,     sizeof(ap.ap.ssid) - 1);
+    strncpy((char *)ap.ap.password, cfg.password, sizeof(ap.ap.password) - 1);
     ap.ap.ssid_len       = strlen((const char *)ap.ap.ssid);
     ap.ap.channel        = 1;
     ap.ap.max_connection = 4;
-    ap.ap.authmode       = WIFI_AUTH_WPA2_PSK;
+    // Open network is legal too, but WPA2 requires ≥ 8 chars for the password.
+    ap.ap.authmode = strlen(cfg.password) >= 8 ? WIFI_AUTH_WPA2_PSK
+                                               : WIFI_AUTH_OPEN;
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    // APSTA so pv_wifi_scan_start() can enumerate networks without dropping
+    // the portal AP off the air.
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     s_state = PV_WIFI_STATE_AP_PORTAL;
-    ESP_LOGI(TAG, "AP SSID=%s password=%s", ap.ap.ssid, ap.ap.password);
+    ESP_LOGI(TAG, "AP SSID=%s ip=%u.%u.%u.%u",
+             ap.ap.ssid,
+             (cfg.ip >> 24) & 0xFF, (cfg.ip >> 16) & 0xFF,
+             (cfg.ip >> 8) & 0xFF,  cfg.ip & 0xFF);
     // Portal is started by app_main after pv_wifi_start returns.
 }
 
@@ -135,12 +203,30 @@ static void start_sta_mode(const char *ssid, const char *pass)
 
 // ---------- Event handlers ----------
 
+static void handle_scan_done(void)
+{
+    uint16_t count = PV_WIFI_SCAN_MAX;
+    wifi_ap_record_t recs[PV_WIFI_SCAN_MAX];
+    esp_err_t err = esp_wifi_scan_get_ap_records(&count, recs);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan_get_ap_records: %s", esp_err_to_name(err));
+        count = 0;
+    }
+    xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+    s_scan_count = count;
+    memcpy(s_scan_cache, recs, count * sizeof(wifi_ap_record_t));
+    s_scanning = false;
+    xSemaphoreGive(s_scan_lock);
+    ESP_LOGI(TAG, "scan done: %d networks", (int)count);
+}
+
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base != WIFI_EVENT) return;
 
     if (id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        // Only auto-connect if we're actually trying to be a station.
+        if (s_state == PV_WIFI_STATE_STA_CONNECTING) esp_wifi_connect();
     } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
         if (s_state == PV_WIFI_STATE_STA_CONNECTING || s_state == PV_WIFI_STATE_STA_CONNECTED) {
             if (s_retry < STA_MAX_RETRIES) {
@@ -152,6 +238,8 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
                 xEventGroupSetBits(s_events, BIT_FAILED);
             }
         }
+    } else if (id == WIFI_EVENT_SCAN_DONE) {
+        handle_scan_done();
     }
 }
 
@@ -196,6 +284,8 @@ esp_err_t pv_wifi_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
     s_events = xEventGroupCreate();
+    s_scan_lock = xSemaphoreCreateMutex();
+    if (s_scan_lock == NULL) return ESP_ERR_NO_MEM;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
@@ -244,3 +334,81 @@ esp_err_t pv_wifi_clear_creds(void)
 }
 
 pv_wifi_state_t pv_wifi_state(void) { return s_state; }
+
+// ---------- Scan ----------
+
+esp_err_t pv_wifi_scan_start(void)
+{
+    if (s_scan_lock == NULL) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+    if (s_scanning) {
+        xSemaphoreGive(s_scan_lock);
+        return ESP_OK;   // scan already in flight — coalesce
+    }
+    s_scanning = true;
+    xSemaphoreGive(s_scan_lock);
+
+    wifi_scan_config_t cfg = {0};   // all channels, active scan, no ssid filter
+    esp_err_t err = esp_wifi_scan_start(&cfg, false);
+    if (err != ESP_OK) {
+        xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+        s_scanning = false;
+        xSemaphoreGive(s_scan_lock);
+        ESP_LOGW(TAG, "scan_start: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+bool pv_wifi_is_scanning(void)
+{
+    if (s_scan_lock == NULL) return false;
+    bool r;
+    xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+    r = s_scanning;
+    xSemaphoreGive(s_scan_lock);
+    return r;
+}
+
+int pv_wifi_get_scan_results(wifi_ap_record_t *out, int max_count)
+{
+    if (out == NULL || max_count <= 0 || s_scan_lock == NULL) return 0;
+    int n;
+    xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+    n = s_scan_count < max_count ? s_scan_count : max_count;
+    memcpy(out, s_scan_cache, n * sizeof(wifi_ap_record_t));
+    xSemaphoreGive(s_scan_lock);
+    return n;
+}
+
+// ---------- AP config ----------
+
+esp_err_t pv_wifi_get_ap_config(pv_wifi_ap_config_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    load_ap_config(out);
+    return ESP_OK;
+}
+
+esp_err_t pv_wifi_set_ap_config_and_reboot(const pv_wifi_ap_config_t *cfg)
+{
+    if (cfg == NULL) return ESP_ERR_INVALID_ARG;
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    // Empty string clears the entry so the default reapplies.
+    if (cfg->ssid[0] == '\0') nvs_erase_key(h, KEY_AP_SSID);
+    else                      nvs_set_str(h, KEY_AP_SSID, cfg->ssid);
+    if (cfg->password[0] == '\0') nvs_erase_key(h, KEY_AP_PASS);
+    else                          nvs_set_str(h, KEY_AP_PASS, cfg->password);
+    if (cfg->ip == 0) nvs_erase_key(h, KEY_AP_IP);
+    else              nvs_set_u32(h, KEY_AP_IP, cfg->ip);
+    err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) return err;
+
+    ESP_LOGI(TAG, "AP config saved; rebooting");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;   // unreachable
+}
