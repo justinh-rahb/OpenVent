@@ -84,11 +84,17 @@ Key details:
 - Per-group config struct is 0x24 bytes; fields at offsets 0x14/0x18/0x1c/0x20
   hold fwd/rev LEDC channel + fwd/rev GPIO. Hall ADC channel is at +0x04.
 
-The 4-group layout suggests the hardware supports controlling multiple vent
-modules from one board (or a multi-flap vent), not a single vent motor. The
-number of *active* groups at runtime is stored at `PTR_DAT_400d0da4` and
-determined during init — likely via strip-detect ADC or a separate
-enumeration. Needs on-hardware confirmation.
+The 4-group layout matches the retail kit inventory: the Panda Vent ships
+with **two vent units, each containing two independent motors** (likely
+one per flap, or open/close pair). The mainboard exposes two 15-pin
+connectors; each 15P cable breaks out to a 5P (RGB board) + 6P (2 motors:
+4 PWM + 2 hall) + likely a 3P (button/detect). All four groups are
+populated in stock hardware — BTT's user manual explicitly states "4 motor
+channel groups (GROUP 1 to 4)".
+
+The runtime count at `PTR_DAT_400d0da4` still exists; it likely defaults
+to 4 but may be overridden for a boardless / partial-kit configuration.
+Not yet traced.
 - LEDC functions used: `ledc_timer_config`, `ledc_channel_config`, `ledc_set_duty`, `ledc_update_duty`, `ledc_set_fade_with_time`, `ledc_fade_start`
 
 ## RGB LED Subsystem
