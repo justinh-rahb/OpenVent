@@ -1,4 +1,5 @@
 #include "pv_board.h"
+#include "pv_moonraker.h"
 #include "pv_motor.h"
 #include "pv_wifi.h"
 
@@ -30,6 +31,7 @@ void app_main(void)
 
     ESP_ERROR_CHECK(pv_motor_init(BOOT_ACTIVE_MOTOR_GROUPS));
     ESP_ERROR_CHECK(pv_wifi_start());
+    ESP_ERROR_CHECK(pv_moonraker_start());
 
 #ifdef PV_MOTOR_SMOKE_TEST
     // ⚠ DEV-ONLY: cycle group 0 open → closed every 5 s. Disable before
