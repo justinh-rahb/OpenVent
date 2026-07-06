@@ -3,3 +3,7 @@ ghidra_project/
 venv/
 decomp/
 *.log
+*.bin
+*.asm
+*.txt
+*.c
