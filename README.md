@@ -34,4 +34,4 @@ The Panda Vent is a smart vent riser for enclosed 3D printers. The stock firmwar
 
 ## License
 
-TBD
+[MIT](LICENSE) © Justin Hayes
