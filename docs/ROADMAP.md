@@ -45,7 +45,12 @@ stock Bambu Lab MQTT integration with Moonraker/Klipper support.
 ### Remaining before hardware bring-up
 - [x] Read hardware-config ADC on GPIO 35 to pick 0/2/4 active motor groups (`pv_motor` samples once per second with 3-cycle debounce; matches stock's hot-plug behavior)
 - [ ] mDNS hostname (`PandaVent.local`)
-- [ ] On-device verification pass (LED indicates mode, motors respond, hall reads plausible, portal reachable)
+- [ ] On-device verification pass:
+  - LED indicates mode correctly
+  - Portal reachable from browser (both AP and STA modes)
+  - Motors respond and hall reads are plausible
+  - Confirm which mainboard chain maps to motor groups 0/1 vs 2/3
+  - Confirm the 3-way config-detect ADC bands hit the expected raw values
 
 ## Phase 2 — RGB & Effects
 
