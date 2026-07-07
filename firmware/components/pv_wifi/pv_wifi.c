@@ -6,6 +6,8 @@
 #include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "dhcpserver/dhcpserver.h"
+#include "dhcpserver/dhcpserver_options.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
@@ -153,6 +155,20 @@ static esp_err_t apply_ap_ip(uint32_t ip_host_order)
         .gw.addr      = htonl(ip_host_order),
     };
     ESP_ERROR_CHECK(esp_netif_set_ip_info(s_ap_netif, &info));
+
+    // Advertise ourselves as the DNS server via DHCP option 6. Without this,
+    // clients that joined never learn where our fake DNS is, iOS/Android
+    // captive-portal probes go to their default DNS (unreachable from our
+    // subnet), and the "Sign in to network" banner never fires.
+    dhcps_offer_t offer_dns = OFFER_DNS;
+    ESP_ERROR_CHECK(esp_netif_dhcps_option(
+        s_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
+        &offer_dns, sizeof(offer_dns)));
+    esp_netif_dns_info_t dns = {
+        .ip = { .u_addr.ip4.addr = info.ip.addr, .type = IPADDR_TYPE_V4 },
+    };
+    ESP_ERROR_CHECK(esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns));
+
     ESP_ERROR_CHECK(esp_netif_dhcps_start(s_ap_netif));
     return ESP_OK;
 }
