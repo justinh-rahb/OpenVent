@@ -155,6 +155,9 @@ static esp_err_t apply_ap_ip(uint32_t ip_host_order)
 static void start_ap_mode(void)
 {
     ESP_LOGI(TAG, "starting AP + captive portal");
+    // Flip state first so any STA disconnect events firing during the driver
+    // restart don't fall into the retry branch and re-issue esp_wifi_connect.
+    s_state = PV_WIFI_STATE_AP_PORTAL;
     ESP_ERROR_CHECK(esp_wifi_stop());
 
     pv_wifi_ap_config_t cfg;
@@ -299,11 +302,19 @@ esp_err_t pv_wifi_start(void)
     char pass[65] = {0};
     if (load_saved_creds(ssid, sizeof(ssid), pass, sizeof(pass))) {
         start_sta_mode(ssid, pass);
-        // Wait briefly for a decision; if STA fails, we'll switch to AP.
+        // Wait for a decision. STA_MAX_RETRIES * ~4 s each ≈ 20 s of real work,
+        // plus a generous margin so a slow-associating AP still has room.
         EventBits_t bits = xEventGroupWaitBits(
             s_events, BIT_CONNECTED | BIT_FAILED, pdFALSE, pdFALSE,
-            pdMS_TO_TICKS(20000));
-        if (bits & BIT_FAILED) start_ap_mode();
+            pdMS_TO_TICKS(30000));
+        // Anything other than "connected" means we're not on a network — even
+        // a plain timeout with no BIT_FAILED. Fall back to the AP portal so
+        // the user has a way to fix the config.
+        if (!(bits & BIT_CONNECTED)) {
+            ESP_LOGW(TAG, "STA never came up (bits=0x%x) — falling back to AP",
+                     (unsigned)bits);
+            start_ap_mode();
+        }
     } else {
         ESP_LOGI(TAG, "no saved WiFi credentials");
         start_ap_mode();
