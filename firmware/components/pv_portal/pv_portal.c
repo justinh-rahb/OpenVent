@@ -740,6 +740,11 @@ esp_err_t pv_portal_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn = httpd_uri_match_wildcard;
+    // Default max_uri_handlers is 8 — we register 9 endpoints in STA and 10
+    // in AP mode (including /* catchall for captive-portal detection). If
+    // this is too low the last-registered handlers silently fail with
+    // "no slots left" and captive portal stops firing.
+    cfg.max_uri_handlers = 16;
     esp_err_t err = httpd_start(&s_httpd, &cfg);
     if (err != ESP_OK) return err;
 
