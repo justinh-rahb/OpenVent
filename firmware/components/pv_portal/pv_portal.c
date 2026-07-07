@@ -240,57 +240,20 @@ static esp_err_t send_moonraker_section(httpd_req_t *req)
     char host_esc[128];
     html_escape(mk_cfg.host, host_esc, sizeof(host_esc));
 
-    // Header + discovered-printers dropdown.
-    SEND(req,
+    char buf[800];
+    snprintf(buf, sizeof(buf),
         "<h2>Moonraker</h2>"
         "<form method=\"POST\" action=\"/moonraker\">"
-        "<label>Discovered on your subnet</label>"
-        "<select name=\"discovered\">"
-        "<option value=\"\">— pick a discovered printer —</option>");
-
-    static pv_moonraker_service_t svcs[PV_MOONRAKER_DISCOVER_MAX];
-    int n = pv_moonraker_get_discovered(svcs, PV_MOONRAKER_DISCOVER_MAX);
-    for (int i = 0; i < n; ++i) {
-        char host_row[80], name_row[80];
-        html_escape(svcs[i].ip, host_row, sizeof(host_row));
-        // Fall back to the IP when the scanner didn't get a friendly name
-        // (subnet scan doesn't resolve one; older mDNS builds did).
-        html_escape(svcs[i].hostname[0] ? svcs[i].hostname : svcs[i].ip,
-                    name_row, sizeof(name_row));
-        char opt[384];
-        snprintf(opt, sizeof(opt),
-            "<option value=\"%s:%u\">%s:%u%s%s%s</option>",
-            host_row, svcs[i].port,
-            name_row, svcs[i].port,
-            svcs[i].hostname[0] ? " (" : "",
-            svcs[i].hostname[0] ? host_row : "",
-            svcs[i].hostname[0] ? ")" : "");
-        SEND(req, opt);
-    }
-
-    const char *disc_hint = pv_moonraker_is_discovering()
-        ? "<div class=\"hint\">Scanning subnet on the configured port…</div>"
-        : (n == 0
-            ? "<div class=\"hint\">Nothing found — save your port and click Rescan.</div>"
-            : "");
-
-    char tail[800];
-    snprintf(tail, sizeof(tail),
-        "</select>"
-        "%s"
         "<div class=\"row\">"
-          "<div><label>Or host / IP manually</label><input name=\"host\" value=\"%s\" maxlength=\"63\"></div>"
+          "<div><label>Host / IP</label><input name=\"host\" value=\"%s\" required maxlength=\"63\"></div>"
           "<div style=\"max-width:130px\"><label>Port</label><input name=\"port\" type=\"number\" value=\"%u\" min=\"1\" max=\"65535\"></div>"
         "</div>"
         "<label>API key (leave blank to keep current)</label>"
         "<input name=\"api_key\" maxlength=\"64\" autocomplete=\"off\">"
         "<button>Save Moonraker</button>"
-        "</form>"
-        "<form method=\"POST\" action=\"/discover_mk\">"
-        "<button class=\"secondary\">Rescan subnet</button>"
         "</form>",
-        disc_hint, host_esc, mk_cfg.port ? mk_cfg.port : 7125);
-    return SEND(req, tail);
+        host_esc, mk_cfg.port ? mk_cfg.port : 7125);
+    return SEND(req, buf);
 }
 
 static esp_err_t send_mode_section(httpd_req_t *req)
@@ -403,21 +366,6 @@ static esp_err_t handle_scan_post(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t handle_discover_post(httpd_req_t *req)
-{
-    esp_err_t err = pv_moonraker_discover_start();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "discover_start: %s", esp_err_to_name(err));
-    }
-    // pv_moonraker's DISCOVER_TIMEOUT_MS is 2 s; wait a hair longer so the
-    // cache is filled before the redirected GET renders.
-    vTaskDelay(pdMS_TO_TICKS(2500));
-    httpd_resp_set_status(req, "303 See Other");
-    httpd_resp_set_hdr(req, "Location", "/");
-    httpd_resp_send(req, NULL, 0);
-    return ESP_OK;
-}
-
 static esp_err_t handle_moonraker_post(httpd_req_t *req)
 {
     char body[512];
@@ -428,33 +376,16 @@ static esp_err_t handle_moonraker_post(httpd_req_t *req)
     pv_moonraker_config_t cfg = {0};
     pv_moonraker_get_config(&cfg);   // start from current (preserves api_key on blank)
 
-    char discovered[80] = {0};
     char host[64] = {0}, port_str[8] = {0}, api_key[65] = {0};
-    form_get(body, "discovered", discovered, sizeof(discovered));
+    if (form_get(body, "host", host, sizeof(host)) != 0 || host[0] == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing host");
+        return ESP_OK;
+    }
+    strncpy(cfg.host, host, sizeof(cfg.host) - 1);
 
-    // Discovered dropdown wins if set — value is "ip:port". Otherwise fall
-    // back to the manual host + port fields.
-    if (discovered[0]) {
-        char *colon = strrchr(discovered, ':');
-        if (colon) {
-            *colon = '\0';
-            strncpy(cfg.host, discovered, sizeof(cfg.host) - 1);
-            long p = strtol(colon + 1, NULL, 10);
-            if (p > 0 && p < 65536) cfg.port = (uint16_t)p;
-        } else {
-            strncpy(cfg.host, discovered, sizeof(cfg.host) - 1);
-        }
-    } else {
-        if (form_get(body, "host", host, sizeof(host)) != 0 || host[0] == '\0') {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing host");
-            return ESP_OK;
-        }
-        strncpy(cfg.host, host, sizeof(cfg.host) - 1);
-
-        if (form_get(body, "port", port_str, sizeof(port_str)) == 0 && port_str[0]) {
-            long p = strtol(port_str, NULL, 10);
-            if (p > 0 && p < 65536) cfg.port = (uint16_t)p;
-        }
+    if (form_get(body, "port", port_str, sizeof(port_str)) == 0 && port_str[0]) {
+        long p = strtol(port_str, NULL, 10);
+        if (p > 0 && p < 65536) cfg.port = (uint16_t)p;
     }
     if (form_get(body, "api_key", api_key, sizeof(api_key)) == 0 && api_key[0] != '\0') {
         strncpy(cfg.api_key, api_key, sizeof(cfg.api_key) - 1);
@@ -565,19 +496,15 @@ esp_err_t pv_portal_start(void)
     httpd_uri_t mk    = { .uri = "/moonraker",  .method = HTTP_POST, .handler = handle_moonraker_post };
     httpd_uri_t mode  = { .uri = "/mode",       .method = HTTP_POST, .handler = handle_mode_post };
     httpd_uri_t apcfg = { .uri = "/ap_config",  .method = HTTP_POST, .handler = handle_ap_post };
-    httpd_uri_t disc  = { .uri = "/discover_mk",.method = HTTP_POST, .handler = handle_discover_post };
     httpd_register_uri_handler(s_httpd, &root);
     httpd_register_uri_handler(s_httpd, &wifi);
     httpd_register_uri_handler(s_httpd, &scan);
     httpd_register_uri_handler(s_httpd, &mk);
     httpd_register_uri_handler(s_httpd, &mode);
     httpd_register_uri_handler(s_httpd, &apcfg);
-    httpd_register_uri_handler(s_httpd, &disc);
 
     // Kick off an initial WiFi scan so the SSID dropdown has entries by the
-    // time the user loads the page. Skip Moonraker discovery — that's a
-    // 250-way TCP-connect sweep of the LAN and would race the WS client's
-    // connect attempt at boot. User triggers it explicitly via "Rescan".
+    // time the user loads the page.
     pv_wifi_scan_start();
 
     if (s_ap_mode) {

@@ -2,17 +2,11 @@
 
 #include "cJSON.h"
 #include "esp_log.h"
-#include "esp_netif.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "lwip/inet.h"
-#include "lwip/sockets.h"
 #include "nvs.h"
-
-#include <errno.h>
-#include <sys/ioctl.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -36,13 +30,6 @@ static pv_moonraker_config_t     s_cfg   = {0};
 static pv_moonraker_status_t     s_status = { .state = PV_MK_DISABLED };
 static char                     *s_rx_buf = NULL;
 static size_t                    s_rx_off = 0;
-
-// mDNS discovery — its own lock so a discovery in flight can't stall the WS
-// receive path.
-static SemaphoreHandle_t       s_discover_lock = NULL;
-static pv_moonraker_service_t  s_discover_cache[PV_MOONRAKER_DISCOVER_MAX];
-static int                     s_discover_count = 0;
-static bool                    s_discovering    = false;
 
 // ---------- NVS ----------
 
@@ -251,8 +238,6 @@ esp_err_t pv_moonraker_start(void)
     if (s_lock != NULL) return ESP_ERR_INVALID_STATE;
     s_lock = xSemaphoreCreateMutex();
     if (s_lock == NULL) return ESP_ERR_NO_MEM;
-    s_discover_lock = xSemaphoreCreateMutex();
-    if (s_discover_lock == NULL) return ESP_ERR_NO_MEM;
 
     s_rx_buf = malloc(RX_BUF_BYTES);
     if (s_rx_buf == NULL) return ESP_ERR_NO_MEM;
@@ -311,175 +296,3 @@ esp_err_t pv_moonraker_clear_config(void)
     return ESP_OK;
 }
 
-// ---------- Subnet discovery ----------
-
-// Non-blocking TCP-connect sweep of the current STA subnet. mDNS was flaky
-// against typical Klipper setups (moonraker.conf doesn't advertise by default
-// on every distro), so we probe the port directly instead. Anything that
-// answers on `port` is treated as a Moonraker candidate — the user picks.
-
-#define SCAN_BATCH_SIZE      32     // parallel non-blocking connects
-#define SCAN_CONNECT_TO_MS   200    // per-batch select timeout
-
-static bool get_sta_subnet(uint32_t *host_ip, uint32_t *subnet, uint32_t *broadcast)
-{
-    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (sta == NULL) return false;
-    esp_netif_ip_info_t info;
-    if (esp_netif_get_ip_info(sta, &info) != ESP_OK) return false;
-    if (info.ip.addr == 0 || info.netmask.addr == 0) return false;
-
-    *host_ip   = ntohl(info.ip.addr);
-    uint32_t m = ntohl(info.netmask.addr);
-    *subnet    = *host_ip & m;
-    *broadcast = *subnet | ~m;
-    return true;
-}
-
-static void record_hit(uint32_t ip_host_order, uint16_t port, int *n)
-{
-    if (*n >= PV_MOONRAKER_DISCOVER_MAX) return;
-    pv_moonraker_service_t *out = &s_discover_cache[*n];
-    memset(out, 0, sizeof(*out));
-    struct in_addr a = { .s_addr = htonl(ip_host_order) };
-    strncpy(out->ip, inet_ntoa(a), sizeof(out->ip) - 1);
-    out->port = port;
-    // No hostname source — leave blank, portal falls back to displaying the IP.
-    (*n)++;
-}
-
-static void discover_task(void *arg)
-{
-    (void)arg;
-
-    uint32_t host_ip = 0, subnet = 0, broadcast = 0;
-    if (!get_sta_subnet(&host_ip, &subnet, &broadcast)) {
-        ESP_LOGW(TAG, "no STA IP; discovery skipped");
-        xSemaphoreTake(s_discover_lock, portMAX_DELAY);
-        s_discover_count = 0;
-        s_discovering    = false;
-        xSemaphoreGive(s_discover_lock);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    uint16_t port = s_cfg.port ? s_cfg.port : DEFAULT_PORT;
-    int hits = 0;
-    int attempts = 0, skipped_alloc = 0, immediate_fails = 0;
-    int last_errno = 0;
-
-    ESP_LOGI(TAG, "subnet scan: %u.%u.%u.0/24 port %u",
-             (unsigned)(host_ip >> 24 & 0xFF), (unsigned)(host_ip >> 16 & 0xFF),
-             (unsigned)(host_ip >> 8 & 0xFF), (unsigned)port);
-
-    // Skip the network and broadcast addresses at each end.
-    for (uint32_t ip = subnet + 1; ip < broadcast && hits < PV_MOONRAKER_DISCOVER_MAX;) {
-        int      fds[SCAN_BATCH_SIZE];
-        uint32_t ips[SCAN_BATCH_SIZE];
-        int      n = 0;
-
-        for (; ip < broadcast && n < SCAN_BATCH_SIZE; ip++) {
-            if (ip == host_ip) continue;   // don't probe ourselves
-            attempts++;
-
-            int fd = socket(AF_INET, SOCK_STREAM, 0);
-            if (fd < 0) { skipped_alloc++; continue; }
-            // ioctl FIONBIO is more reliable on lwip than fcntl.
-            int flag = 1;
-            ioctl(fd, FIONBIO, &flag);
-
-            struct sockaddr_in addr = {
-                .sin_family      = AF_INET,
-                .sin_port        = htons(port),
-                .sin_addr.s_addr = htonl(ip),
-            };
-            int r = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
-            // Accept anything that isn't an immediate hard failure. Notably
-            // EINPROGRESS / EWOULDBLOCK / EAGAIN all mean "SYN sent, waiting".
-            if (r == 0 || errno == EINPROGRESS || errno == EWOULDBLOCK ||
-                errno == EAGAIN || errno == 0) {
-                fds[n] = fd;
-                ips[n] = ip;
-                n++;
-            } else {
-                last_errno = errno;
-                immediate_fails++;
-                close(fd);
-            }
-        }
-        if (n == 0) continue;
-
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        int maxfd = 0;
-        for (int i = 0; i < n; ++i) {
-            FD_SET(fds[i], &wfds);
-            if (fds[i] > maxfd) maxfd = fds[i];
-        }
-        struct timeval tv = { .tv_sec = 0, .tv_usec = SCAN_CONNECT_TO_MS * 1000 };
-        select(maxfd + 1, NULL, &wfds, NULL, &tv);
-
-        for (int i = 0; i < n; ++i) {
-            if (FD_ISSET(fds[i], &wfds)) {
-                int err = 0;
-                socklen_t elen = sizeof(err);
-                if (getsockopt(fds[i], SOL_SOCKET, SO_ERROR, &err, &elen) == 0 && err == 0) {
-                    record_hit(ips[i], port, &hits);
-                }
-            }
-            close(fds[i]);
-        }
-    }
-
-    xSemaphoreTake(s_discover_lock, portMAX_DELAY);
-    s_discover_count = hits;
-    s_discovering    = false;
-    xSemaphoreGive(s_discover_lock);
-    ESP_LOGI(TAG, "subnet scan done: %d responder(s) on :%u"
-                  " (attempts=%d, alloc_fail=%d, immediate_err=%d, last_errno=%d)",
-             hits, (unsigned)port, attempts, skipped_alloc, immediate_fails, last_errno);
-    vTaskDelete(NULL);
-}
-
-esp_err_t pv_moonraker_discover_start(void)
-{
-    if (s_discover_lock == NULL) return ESP_ERR_INVALID_STATE;
-    xSemaphoreTake(s_discover_lock, portMAX_DELAY);
-    if (s_discovering) {
-        xSemaphoreGive(s_discover_lock);
-        return ESP_OK;   // coalesce
-    }
-    s_discovering = true;
-    xSemaphoreGive(s_discover_lock);
-
-    // One-shot task; self-deletes when done. Needs its own stack for the
-    // ~256 non-blocking sockets we open in batches.
-    if (xTaskCreate(discover_task, "pv_mk_disc", 4096, NULL, 4, NULL) != pdPASS) {
-        xSemaphoreTake(s_discover_lock, portMAX_DELAY);
-        s_discovering = false;
-        xSemaphoreGive(s_discover_lock);
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
-}
-
-bool pv_moonraker_is_discovering(void)
-{
-    if (s_discover_lock == NULL) return false;
-    bool r;
-    xSemaphoreTake(s_discover_lock, portMAX_DELAY);
-    r = s_discovering;
-    xSemaphoreGive(s_discover_lock);
-    return r;
-}
-
-int pv_moonraker_get_discovered(pv_moonraker_service_t *out, int max)
-{
-    if (out == NULL || max <= 0 || s_discover_lock == NULL) return 0;
-    int n;
-    xSemaphoreTake(s_discover_lock, portMAX_DELAY);
-    n = s_discover_count < max ? s_discover_count : max;
-    memcpy(out, s_discover_cache, n * sizeof(pv_moonraker_service_t));
-    xSemaphoreGive(s_discover_lock);
-    return n;
-}

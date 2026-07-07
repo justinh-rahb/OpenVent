@@ -73,7 +73,7 @@ To match the stock BTT firmware capabilities, the following features must be imp
 - [x] Apply & Reboot: Require and handle device reboot to apply AP changes (`pv_wifi_set_ap_config_and_reboot`)
 
 ### Printer (Moonraker) Page Parity
-- [x] Printer Discovery: subnet TCP-connect sweep on the configured port (default 7125) populates a dropdown of responders. (Originally attempted via mDNS `_moonraker._tcp` but most Klipper installs don't advertise it, so we probe the port directly instead — much more reliable in practice.)
+- [ ] Printer Discovery: tried mDNS `_moonraker._tcp` (most Klipper installs don't advertise it) and then a subnet TCP-connect sweep (fired but never found anything on-hardware). Both removed for now — users configure host/port manually. Worth revisiting with better diagnostics on a live LAN.
 
 ### Settings Page Parity
 - [ ] OTA Updates: Implement `.bin` upload via Web UI and OTA flashing process
