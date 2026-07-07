@@ -33,6 +33,23 @@ The Panda Vent is a smart vent riser for enclosed 3D printers. The stock firmwar
 
 Full pin map + provenance: [docs/HARDWARE_ANALYSIS.md](docs/HARDWARE_ANALYSIS.md).
 
+## ⚠ Back up your stock firmware first
+
+Before flashing anything from this project, **dump the whole flash** so you have
+a way back. BTT doesn't publish source or release binaries for the Panda Vent,
+so if you lose the stock image there's no official way to recover it.
+
+```
+python -m pip install esptool
+python -m esptool --chip esp32 -p PORT -b 460800 read_flash 0x0 0x400000 stock-panda-vent-backup.bin
+```
+
+Keep that file somewhere safe. To go back to stock at any time:
+
+```
+python -m esptool --chip esp32 -p PORT -b 460800 write_flash 0x0 stock-panda-vent-backup.bin
+```
+
 ## Status
 
 🚧 **Phase 1 firmware complete, awaiting hardware bring-up.** Every component compiles against ESP-IDF v5.3+; on-device verification is the next milestone.

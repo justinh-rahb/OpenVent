@@ -244,7 +244,7 @@ static esp_err_t send_moonraker_section(httpd_req_t *req)
     SEND(req,
         "<h2>Moonraker</h2>"
         "<form method=\"POST\" action=\"/moonraker\">"
-        "<label>Discovered printers</label>"
+        "<label>Discovered on your subnet</label>"
         "<select name=\"discovered\">"
         "<option value=\"\">— pick a discovered printer —</option>");
 
@@ -252,23 +252,26 @@ static esp_err_t send_moonraker_section(httpd_req_t *req)
     int n = pv_moonraker_get_discovered(svcs, PV_MOONRAKER_DISCOVER_MAX);
     for (int i = 0; i < n; ++i) {
         char host_row[80], name_row[80];
-        html_escape(svcs[i].hostname, name_row, sizeof(name_row));
-        html_escape(svcs[i].ip,       host_row, sizeof(host_row));
-        // hostname + IP each up to 79 chars escaped → worst case ~280 bytes.
+        html_escape(svcs[i].ip, host_row, sizeof(host_row));
+        // Fall back to the IP when the scanner didn't get a friendly name
+        // (subnet scan doesn't resolve one; older mDNS builds did).
+        html_escape(svcs[i].hostname[0] ? svcs[i].hostname : svcs[i].ip,
+                    name_row, sizeof(name_row));
         char opt[384];
-        // value carries the IP+port we'll actually use; label shows the mDNS
-        // hostname so the user can find their printer.
         snprintf(opt, sizeof(opt),
-            "<option value=\"%s:%u\">%s (%s:%u)</option>",
+            "<option value=\"%s:%u\">%s:%u%s%s%s</option>",
             host_row, svcs[i].port,
-            name_row, host_row, svcs[i].port);
+            name_row, svcs[i].port,
+            svcs[i].hostname[0] ? " (" : "",
+            svcs[i].hostname[0] ? host_row : "",
+            svcs[i].hostname[0] ? ")" : "");
         SEND(req, opt);
     }
 
     const char *disc_hint = pv_moonraker_is_discovering()
-        ? "<div class=\"hint\">Searching…</div>"
+        ? "<div class=\"hint\">Scanning subnet on the configured port…</div>"
         : (n == 0
-            ? "<div class=\"hint\">No printers cached — click Discover.</div>"
+            ? "<div class=\"hint\">Nothing found — save your port and click Rescan.</div>"
             : "");
 
     char tail[800];
@@ -284,7 +287,7 @@ static esp_err_t send_moonraker_section(httpd_req_t *req)
         "<button>Save Moonraker</button>"
         "</form>"
         "<form method=\"POST\" action=\"/discover_mk\">"
-        "<button class=\"secondary\">Rediscover printers</button>"
+        "<button class=\"secondary\">Rescan subnet</button>"
         "</form>",
         disc_hint, host_esc, mk_cfg.port ? mk_cfg.port : 7125);
     return SEND(req, tail);

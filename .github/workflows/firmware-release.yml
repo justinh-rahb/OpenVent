@@ -61,6 +61,16 @@ jobs:
           set -euo pipefail
 
           cat > release_notes.md <<'NOTES'
+          ## ⚠ Back up your stock firmware first
+
+          This replaces the stock BTT firmware. There is currently **no signed image to roll back to** — BTT doesn't publish source or release binaries for the Panda Vent. Dump the whole flash before you write over it:
+
+          ```
+          python -m esptool --chip esp32 -p PORT -b 460800 read_flash 0x0 0x400000 stock-panda-vent-backup.bin
+          ```
+
+          Keep that file somewhere safe. If you ever want to go back to stock, flash it exactly the same way as the new image (`write_flash 0x0 stock-panda-vent-backup.bin`).
+
           ## Flashing
 
           Install esptool:
@@ -81,7 +91,7 @@ jobs:
 
           ## First boot
 
-          The device comes up as **`Panda_Vent_XXXX`** (open WiFi hotspot, WPA2 password `987654321`, matching the stock firmware). Join it, the captive portal will pop, and you can enter your home WiFi + Moonraker printer from there. It also advertises on mDNS as **`PandaVent.local`** once it joins your LAN.
+          The device comes up as **`Panda_Vent_XXXX`** (WPA2 hotspot, password `987654321`, matching the stock firmware). Join it, the captive portal will pop, and you can enter your home WiFi + Moonraker printer from there. It also advertises on mDNS as **`PandaVent.local`** once it joins your LAN.
 
           ## Verify download
 

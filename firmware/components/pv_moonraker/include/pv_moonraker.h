@@ -41,9 +41,12 @@ esp_err_t pv_moonraker_get_status(pv_moonraker_status_t *out);
 // Wipe saved Moonraker config. Used for factory reset.
 esp_err_t pv_moonraker_clear_config(void);
 
-// mDNS discovery of Moonraker services on the LAN (_moonraker._tcp). Results
-// land in a small in-memory cache. Same async pattern as pv_wifi_scan_start —
-// spawn, wait a couple seconds, then read the cache.
+// LAN discovery of Moonraker instances. Runs a non-blocking TCP-connect sweep
+// of the current STA subnet on the configured port (default 7125) and caches
+// the responders. Same async pattern as pv_wifi_scan_start — spawn, wait a
+// couple seconds, then read the cache. mDNS turned out to be too unreliable
+// (most Klipper installs don't advertise `_moonraker._tcp` by default), so
+// probing the port directly is what actually finds printers.
 #define PV_MOONRAKER_DISCOVER_MAX 8
 
 typedef struct {

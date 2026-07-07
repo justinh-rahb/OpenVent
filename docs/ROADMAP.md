@@ -44,12 +44,20 @@ stock Bambu Lab MQTT integration with Moonraker/Klipper support.
 - [x] Read hardware-config ADC on GPIO 35 to pick 0/2/4 active motor groups
 
 ### Remaining Core Verification
-- [ ] On-device verification pass:
-  - LED indicates mode correctly
-  - Portal reachable from browser (both AP and STA modes)
-  - Motors respond and hall reads are plausible
-  - Confirm which mainboard chain maps to motor groups 0/1 vs 2/3
-  - Confirm the 3-way config-detect ADC bands hit the expected raw values
+Verified on a bare ESP32 devkit (no vent hardware attached):
+- [x] Boots cleanly, no panics
+- [x] LED (GPIO 27) driven correctly when policy mode changes
+- [x] Portal reachable from a phone in both AP and STA modes
+- [x] Captive portal detection triggers on iOS / Android
+- [x] WiFi scan populates the SSID dropdown
+- [x] mDNS `PandaVent.local` resolves on the LAN
+- [x] Config-detect ADC reports 0 groups on the bare board (unpopulated pin)
+
+Still needs actual Panda Vent hardware:
+- [ ] Motors respond and hall ADC reads are plausible
+- [ ] Confirm which mainboard chain maps to motor groups 0/1 vs 2/3
+- [ ] Confirm the 3-way config-detect ADC bands hit the expected raw values
+- [ ] WS2812 outputs light up on the LED boards
 
 ## Phase 2 — Firmware Parity (Web UI & Settings)
 
@@ -65,7 +73,7 @@ To match the stock BTT firmware capabilities, the following features must be imp
 - [x] Apply & Reboot: Require and handle device reboot to apply AP changes (`pv_wifi_set_ap_config_and_reboot`)
 
 ### Printer (Moonraker) Page Parity
-- [ ] Printer Discovery: Implement mDNS discovery for `_moonraker._tcp` to populate a selectable list of printers on the LAN, eliminating manual IP entry
+- [x] Printer Discovery: subnet TCP-connect sweep on the configured port (default 7125) populates a dropdown of responders. (Originally attempted via mDNS `_moonraker._tcp` but most Klipper installs don't advertise it, so we probe the port directly instead — much more reliable in practice.)
 
 ### Settings Page Parity
 - [ ] OTA Updates: Implement `.bin` upload via Web UI and OTA flashing process
