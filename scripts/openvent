@@ -123,7 +123,9 @@ cmd_install() {
     else
         [ -n "$tag" ] || tag="latest"
         image="$(mktemp -t openvent-full.XXXXXX.bin)"
-        trap 'rm -f "$image"' EXIT
+        # Guarded expansion so the EXIT trap doesn't trip `set -u` after a
+        # successful install has run its full path.
+        trap 'rm -f "${image:-}"' EXIT
         download_release "$tag" "$image"
         echo "→ installing release $tag on $port"
     fi
