@@ -75,6 +75,7 @@ typedef struct {
     bool              running;
     int               retries;
     TickType_t        drive_started_tick;
+    TickType_t        last_diag_tick;      // last time we logged hall raw+state
     pv_motor_hall_t   hall_cached;
 } group_state_t;
 
@@ -121,6 +122,10 @@ static pv_motor_hall_t classify_hall(int raw)
     return PV_HALL_MID_HIGH;
 }
 
+// Cache of the last raw hall reading per group so retry / give-up logs can
+// print it without having to plumb the value through every return path.
+static int s_hall_raw_last[PV_MOTOR_GROUP_COUNT];
+
 static pv_motor_hall_t read_hall(int g)
 {
     int raw = 0;
@@ -129,6 +134,7 @@ static pv_motor_hall_t read_hall(int g)
         ESP_LOGW(TAG, "hall read grp=%d failed: %s", g, esp_err_to_name(err));
         return PV_HALL_INVALID;
     }
+    s_hall_raw_last[g] = raw;
     return classify_hall(raw);
 }
 
@@ -307,6 +313,21 @@ static void tick_group(int g)
     pv_motor_hall_t hall = read_hall(g);
     st->hall_cached = hall;
 
+    // Diagnostic: while a group is actively driving, log raw ADC + classified
+    // state every second. Lets us see exactly what values the hall reports at
+    // each endpoint on a given board without a probe.
+    if (st->running) {
+        TickType_t now = xTaskGetTickCount();
+        if (now - st->last_diag_tick >= pdMS_TO_TICKS(1000)) {
+            st->last_diag_tick = now;
+            ESP_LOGI(TAG, "grp=%d driving (want=%s) hall_raw=%d hall_state=%d",
+                     g,
+                     want == PV_MOTOR_TARGET_OPEN   ? "OPEN"
+                   : want == PV_MOTOR_TARGET_CLOSED ? "CLOSED" : "STOP",
+                     s_hall_raw_last[g], (int)hall);
+        }
+    }
+
     // Stop requested.
     if (want == PV_MOTOR_TARGET_STOP) {
         if (st->running) stop_drive(g);
@@ -337,12 +358,17 @@ static void tick_group(int g)
     // Timed out without hitting the endpoint — retry or give up.
     if (st->retries < MAX_RETRIES) {
         st->retries++;
-        ESP_LOGW(TAG, "grp=%d stalled; retry %d/%d", g, st->retries, MAX_RETRIES);
+        ESP_LOGW(TAG, "grp=%d stalled; retry %d/%d (hall_raw=%d hall_state=%d)",
+                 g, st->retries, MAX_RETRIES, s_hall_raw_last[g], (int)hall);
         stop_drive(g);
         vTaskDelay(pdMS_TO_TICKS(RETRY_PAUSE_MS));
         begin_drive_toward(g, want);
     } else {
-        ESP_LOGE(TAG, "grp=%d gave up after %d retries (hall=%d)", g, MAX_RETRIES, hall);
+        ESP_LOGE(TAG, "grp=%d gave up after %d retries (want=%s hall_raw=%d hall_state=%d)",
+                 g, MAX_RETRIES,
+                 want == PV_MOTOR_TARGET_OPEN   ? "OPEN"
+               : want == PV_MOTOR_TARGET_CLOSED ? "CLOSED" : "STOP",
+                 s_hall_raw_last[g], (int)hall);
         stop_drive(g);
         // Leave target intact — the caller can decide to re-issue.
     }
