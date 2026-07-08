@@ -89,17 +89,35 @@ cmd_restore() {
 }
 
 # Download a release asset. Prefers `gh` if available for auth/rate-limit
-# reasons; falls back to curl for anonymous fetch.
+# reasons; falls back to curl for anonymous fetch. Handles both the old
+# (openvent-full.bin) and new (openvent-vX.Y.Z-full.bin) naming schemes.
 download_release() {
     local tag="$1" out="$2"
     if command -v gh >/dev/null 2>&1; then
+        # New tagged name first, fall back to the original bare name.
+        gh release download "$tag" --repo "$REPO" \
+            --pattern "openvent-${tag}-full.bin" --output "$out" --clobber 2>/dev/null && return 0
         gh release download "$tag" --repo "$REPO" \
             --pattern 'openvent-full.bin' --output "$out" --clobber
     else
-        local url="https://github.com/$REPO/releases/download/$tag/openvent-full.bin"
-        [ "$tag" = "latest" ] && url="https://github.com/$REPO/releases/latest/download/openvent-full.bin"
-        echo "→ fetching $url"
-        curl -fSL "$url" -o "$out" || die "download failed — check the tag or network"
+        local base_new="openvent-${tag}-full.bin"
+        local base_old="openvent-full.bin"
+        local candidates=(
+            "https://github.com/$REPO/releases/download/$tag/$base_new"
+            "https://github.com/$REPO/releases/download/$tag/$base_old"
+        )
+        if [ "$tag" = "latest" ]; then
+            candidates=(
+                "https://github.com/$REPO/releases/latest/download/$base_old"
+            )
+        fi
+        for url in "${candidates[@]}"; do
+            echo "→ trying $url"
+            if curl -fSL "$url" -o "$out" 2>/dev/null; then
+                return 0
+            fi
+        done
+        die "download failed — check the tag or network"
     fi
 }
 

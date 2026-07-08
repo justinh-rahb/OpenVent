@@ -129,19 +129,26 @@ Per motor (from `motor.c` decompilation):
 - Stop: fade active channel duty to 0 over 10 ms, then hard-off both
 - Up to 4 retries if hall doesn't confirm the target position
 
-Hall reading (from `motor_adc.c`) applies **factory line-fitting calibration**
-via `adc_cali_raw_to_voltage` before classifying — the numeric thresholds are
-millivolts, not raw ADC counts (confirmed by the `adc_cali_raw_to_voltage` and
-`adc_cali_create_scheme_line_fitting` symbol references in stock's binary at
-`3f42a91c` / `3f42a934`).
+Hall reading (from `motor_adc.c`) in stock **applies factory line-fitting
+calibration** via `adc_cali_raw_to_voltage` before classifying — the numeric
+thresholds are millivolts, not raw ADC counts (confirmed by the
+`adc_cali_raw_to_voltage` and `adc_cali_create_scheme_line_fitting` symbol
+references in stock's binary at `3f42a91c` / `3f42a934`).
 
-| Return | Meaning                        | Calibrated mV range     |
-|--------|--------------------------------|-------------------------|
-| 0      | invalid / disconnected         | 0                       |
-| 1      | **OPEN endpoint** (fan-on)     | 640–960 mV  (0x280–0x3c0) |
-| 2      | **CLOSED endpoint** (fan-off)  | 1360–1680 mV (0x550–0x690) |
-| 3      | past-closed / over-travel      | mv + (-2080) < 0x173 (~2080–2450 mV) |
-| 4      | in transit (catch-all)         | anything else            |
+| Return | Meaning                        | Calibrated mV range (stock)      |
+|--------|--------------------------------|----------------------------------|
+| 0      | invalid / disconnected         | 0                                |
+| 1      | **OPEN endpoint** (fan-on)     | 640–960 mV  (0x280–0x3c0)        |
+| 2      | **CLOSED endpoint** (fan-off)  | 1360–1680 mV (0x550–0x690)       |
+| 3      | past-closed / over-travel      | `mv + (-2080) < 0x173` (~2080–2450 mV) |
+| 4      | in transit (catch-all)         | anything else                    |
+
+> **Note (v0.2.5):** OpenVent temporarily uses raw ADC counts with a widened
+> OPEN band because initialising `adc_cali_create_scheme_line_fitting` on real
+> Panda Vent hardware disrupted shared ADC/GPIO state in v0.2.4 (WS2812 strips
+> on GPIO 4 / GPIO 14 latched red at boot; the board hung after repeated motor
+> commands). We plan to reintroduce calibration once the interaction is
+> understood — the OPEN band widening is a stop-gap until then.
 
 Direction of "OPEN" vs "CLOSED" was derived from the main state machine
 (`FUN_400de55c`, lines 36–43): stock reads the user's fan-on/off intent

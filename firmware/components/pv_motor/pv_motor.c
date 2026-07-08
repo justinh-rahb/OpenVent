@@ -2,8 +2,6 @@
 #include "pv_board.h"
 
 #include "driver/ledc.h"
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -31,24 +29,25 @@ static const char *TAG = "pv_motor";
 #define MAX_RETRIES         4
 #define TICK_MS             10                  // task loop period
 
-// Hall thresholds — **millivolts**, applied to the calibrated ADC voltage,
-// not the raw ADC counts. Stock's hall_get_state (FUN_400deb24) does:
-//     adc_oneshot_read(handle, ch, &raw)
-//     adc_cali_raw_to_voltage(cali, raw, &mv)   ← key step
-//     if      (mv ∈ [0x550, 0x690)) return 2;   ← CLOSED
-//     else if (mv ∈ [0x280, 0x3c0)) return 1;   ← OPEN
-//     else if ((mv + -2080) < 0x173) return 3;  ← past-closed
-//     else                          return 4;   ← in transit
+// Hall thresholds — raw ADC counts. Compared directly against the value from
+// adc_oneshot_read; no calibration in the loop.
 //
-// We used raw ADC before v0.2.4 and got asymmetric behaviour on real
-// hardware (Close would arrive, Open wouldn't), because the raw→mV line
-// fit isn't identity — the discrepancy varies with chip VREF and is more
-// pronounced at lower voltages where OPEN lives.
-#define HALL_OPEN_LO_MV     0x280      // 640 mV
-#define HALL_OPEN_HI_MV     0x3c0      // 960 mV
-#define HALL_CLOSED_LO_MV   0x550      // 1360 mV
-#define HALL_CLOSED_HI_MV   0x690      // 1680 mV
-#define HALL_MID_LOW_TEST   0x173      // 371
+// Stock's hall_get_state runs the raw sample through adc_cali_raw_to_voltage
+// before comparing, but the v0.2.4 field test showed that enabling calibration
+// somehow disrupted shared ADC/GPIO state on the real BTT board — WS2812 strips
+// on ADC2 pins (GPIO 4 / GPIO 14) latched garbage red at boot and the board
+// hung on repeated motor commands. Backing out cali until we understand why.
+//
+// The CLOSED band matched real hardware at the 2026-07-07 test, so we keep it
+// tight. The OPEN band from stock (0x280..0x3c0) missed the tester's actual
+// reading, so we widen it aggressively to any raw value clearly below CLOSED —
+// on a hall sensor the two endpoints sit at opposite voltage rails, so
+// mid-travel readings look nothing like the endpoints.
+#define HALL_OPEN_LO        0x100      // ~90 mV worth of headroom below OPEN
+#define HALL_OPEN_HI        0x500      // stop short of CLOSED (0x550)
+#define HALL_CLOSED_LO      0x550
+#define HALL_CLOSED_HI      0x690
+#define HALL_MID_LOW_TEST   0x173
 #define HALL_MID_OFFSET     (-2080)    // signed; 0xfffff7e0 as int32
 
 // Config-detect thresholds — from stock's FUN_400deb88. Three bands with
@@ -83,7 +82,6 @@ typedef struct {
 
 static int              s_active_groups = 0;
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
-static adc_cali_handle_t          s_adc_cali   = NULL;
 static group_state_t    s_groups[PV_MOTOR_GROUP_COUNT];
 static SemaphoreHandle_t s_lock = NULL;
 static TaskHandle_t     s_task = NULL;
@@ -115,22 +113,19 @@ static inline pv_motor_hall_t hall_for_target(pv_motor_target_t t)
     return PV_HALL_INVALID;
 }
 
-// Match stock's classification: all comparisons are against calibrated
-// millivolts, not raw ADC counts.
-static pv_motor_hall_t classify_hall_mv(int mv)
+static pv_motor_hall_t classify_hall(int raw)
 {
-    if (mv <= 0) return PV_HALL_INVALID;
-    if (mv >= HALL_OPEN_LO_MV   && mv < HALL_OPEN_HI_MV)   return PV_HALL_OPEN;
-    if (mv >= HALL_CLOSED_LO_MV && mv < HALL_CLOSED_HI_MV) return PV_HALL_CLOSED;
-    // Stock: `(mv + -2080) < 0x173` → unsigned wrap picks the low mid band.
-    if ((uint32_t)(mv + HALL_MID_OFFSET) < HALL_MID_LOW_TEST) return PV_HALL_MID_LOW;
+    if (raw == 0) return PV_HALL_INVALID;
+    // Check CLOSED first (matches stock's ordering — state 2 before state 1).
+    if (raw >= HALL_CLOSED_LO && raw < HALL_CLOSED_HI) return PV_HALL_CLOSED;
+    if (raw >= HALL_OPEN_LO   && raw < HALL_OPEN_HI)   return PV_HALL_OPEN;
+    if ((uint32_t)(raw + HALL_MID_OFFSET) < HALL_MID_LOW_TEST) return PV_HALL_MID_LOW;
     return PV_HALL_MID_HIGH;
 }
 
-// Caches of the last raw ADC + calibrated mV per group so the diagnostic log
-// paths can print them without plumbing values through every return.
+// Cache of the last raw ADC per group so diagnostic log paths can print it
+// without plumbing the value through every return.
 static int s_hall_raw_last[PV_MOTOR_GROUP_COUNT];
-static int s_hall_mv_last[PV_MOTOR_GROUP_COUNT];
 
 static pv_motor_hall_t read_hall(int g)
 {
@@ -141,15 +136,7 @@ static pv_motor_hall_t read_hall(int g)
         return PV_HALL_INVALID;
     }
     s_hall_raw_last[g] = raw;
-
-    int mv = raw;   // safe fallback if calibration isn't available
-    if (s_adc_cali != NULL) {
-        if (adc_cali_raw_to_voltage(s_adc_cali, raw, &mv) != ESP_OK) {
-            mv = raw;
-        }
-    }
-    s_hall_mv_last[g] = mv;
-    return classify_hall_mv(mv);
+    return classify_hall(raw);
 }
 
 // Read the config-detect ADC and classify to an active-group count. Returns
@@ -334,11 +321,11 @@ static void tick_group(int g)
         TickType_t now = xTaskGetTickCount();
         if (now - st->last_diag_tick >= pdMS_TO_TICKS(1000)) {
             st->last_diag_tick = now;
-            ESP_LOGI(TAG, "grp=%d driving (want=%s) hall_raw=%d hall_mv=%d hall_state=%d",
+            ESP_LOGI(TAG, "grp=%d driving (want=%s) hall_raw=%d hall_state=%d",
                      g,
                      want == PV_MOTOR_TARGET_OPEN   ? "OPEN"
                    : want == PV_MOTOR_TARGET_CLOSED ? "CLOSED" : "STOP",
-                     s_hall_raw_last[g], s_hall_mv_last[g], (int)hall);
+                     s_hall_raw_last[g], (int)hall);
         }
     }
 
@@ -372,18 +359,17 @@ static void tick_group(int g)
     // Timed out without hitting the endpoint — retry or give up.
     if (st->retries < MAX_RETRIES) {
         st->retries++;
-        ESP_LOGW(TAG, "grp=%d stalled; retry %d/%d (hall_raw=%d hall_mv=%d hall_state=%d)",
-                 g, st->retries, MAX_RETRIES,
-                 s_hall_raw_last[g], s_hall_mv_last[g], (int)hall);
+        ESP_LOGW(TAG, "grp=%d stalled; retry %d/%d (hall_raw=%d hall_state=%d)",
+                 g, st->retries, MAX_RETRIES, s_hall_raw_last[g], (int)hall);
         stop_drive(g);
         vTaskDelay(pdMS_TO_TICKS(RETRY_PAUSE_MS));
         begin_drive_toward(g, want);
     } else {
-        ESP_LOGE(TAG, "grp=%d gave up after %d retries (want=%s hall_raw=%d hall_mv=%d hall_state=%d)",
+        ESP_LOGE(TAG, "grp=%d gave up after %d retries (want=%s hall_raw=%d hall_state=%d)",
                  g, MAX_RETRIES,
                  want == PV_MOTOR_TARGET_OPEN   ? "OPEN"
                : want == PV_MOTOR_TARGET_CLOSED ? "CLOSED" : "STOP",
-                 s_hall_raw_last[g], s_hall_mv_last[g], (int)hall);
+                 s_hall_raw_last[g], (int)hall);
         stop_drive(g);
         // Leave target intact — the caller can decide to re-issue.
     }
@@ -431,24 +417,6 @@ esp_err_t pv_motor_init(void)
     // channels come online as groups activate.
     adc_oneshot_unit_init_cfg_t unit = { .unit_id = ADC_UNIT_1 };
     ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&unit, &s_adc_handle), TAG, "adc unit");
-
-    // Line-fitting calibration so raw-ADC → millivolts is done with the
-    // per-chip VREF from eFuse (falls back to a fixed constant if that fuse
-    // wasn't burnt at the factory). Stock's binary also uses line-fitting
-    // (adc_cali_create_scheme_line_fitting) so we match its accuracy — the
-    // hall thresholds are all specified in mV to line up with what stock
-    // compares against.
-    adc_cali_line_fitting_config_t cali_cfg = {
-        .unit_id  = ADC_UNIT_1,
-        .atten    = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-    };
-    esp_err_t cali_err = adc_cali_create_scheme_line_fitting(&cali_cfg, &s_adc_cali);
-    if (cali_err != ESP_OK) {
-        ESP_LOGW(TAG, "adc cali unavailable (%s) — falling back to raw ADC",
-                 esp_err_to_name(cali_err));
-        s_adc_cali = NULL;
-    }
 
     adc_oneshot_chan_cfg_t detect_cfg = {
         .bitwidth = ADC_BITWIDTH_DEFAULT,
