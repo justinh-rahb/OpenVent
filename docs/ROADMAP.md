@@ -6,145 +6,170 @@ stock Bambu Lab MQTT integration with Moonraker/Klipper support.
 ## Goals
 
 - Repurpose stock Panda Vent hardware for Klipper-based printers
-- Automatically open/close the vent based on printer status (bed temperature)
+- Automatically open/close the vent based on printer status, material, and
+  chamber conditions — matching (and eventually exceeding) stock behavior
 - Provide a captive portal AP for WiFi setup (like stock firmware)
-- Simple web UI for Moonraker connection settings
+- Simple web UI for Moonraker connection, thresholds, and material rules
 - OTA firmware updates via web UI
-- Complete feature parity with original Bigtreetech firmware
+- Complete feature parity with the stock Bigtreetech firmware where it
+  makes sense; skip cloud-only features
 
-## Phase 1 — MVP (Hardware Bring-up & Core Logic)
+## Phase 1 — MVP (Hardware Bring-up & Core Logic) — ✅ shipped in v0.2.6
+
+Baseline "vents move on real hardware, don't crash, portal works" release.
+Verified against tester OldGuyMeltsPlastic's retail 2-vent kit on
+2026-07-10 — 10× open/close cycles with no ESP crash.
 
 ### Vent Control via Moonraker
 - [x] Connect to Moonraker via WebSocket (`pv_moonraker`)
 - [x] Subscribe to `print_stats` and `heater_bed` objects
 - [x] Open vent when bed is heated / printing is active (`pv_policy`, AUTO mode)
 - [x] Close vent when bed cools down / printer is idle (35 °C / 45 °C hysteresis)
-- [x] Auto/manual mode toggle via physical button (GPIO 12) (`pv_button` + `app_main`)
+- [x] Auto/manual mode toggle via physical button (GPIO 12)
 - [x] Long-press button to switch between auto and manual mode
 
 ### WiFi & Captive Portal
-- [x] AP mode on first boot (captive portal with DNS redirect) (`pv_wifi` + `pv_portal`)
+- [x] AP mode on first boot with DNS-redirect captive portal
 - [x] Web page to enter SSID + password
-- [x] Store WiFi credentials in NVS (`app_nvs` namespace, stock-compatible)
-- [x] Auto-reconnect to saved WiFi on boot
-- [x] Advertise `OpenVent.local` over mDNS
+- [x] Credentials stored in NVS
+- [x] Auto-reconnect on boot
+- [x] mDNS `OpenVent.local`
 
-### Moonraker Configuration
-- [x] Web page: enter Moonraker IP/hostname and port
-- [x] Optional API key field
-- [x] Store config in NVS
-- [x] Connection status indicator on web UI (status header)
+### Motor + Hall
+- [x] LEDC PWM forward/reverse with fade-based soft-start
+- [x] Hall-sensor position feedback with arrival debounce (30 ms) and
+      finite retry (`gave_up` flag) — v0.2.6
+- [x] Widened CLOSED band to survive the non-monotonic mid-travel hump
 
-### Hardware Drivers
-- [x] GPIO pin assignments confirmed via Ghidra disassembly ([HARDWARE_ANALYSIS](HARDWARE_ANALYSIS.md))
-- [x] Motor driver: LEDC PWM forward/reverse with soft-start (`pv_motor`)
-- [x] Hall sensor reading for vent position feedback (5-state classifier)
-- [x] Button handler: debounce, single-click, long-press (`pv_button`)
-- [x] Status LED on user button (`pv_status_led`; GPIO 27, off = auto, blink = manual)
-- [x] Read hardware-config ADC on GPIO 35 to pick 0/2/4 active motor groups
+### Portal Parity (Web UI)
+- [x] Tabbed layout (Home / WiFi / Printer / System)
+- [x] Persistent status card (fw version, WiFi, Moonraker, printer state, bed, target, mode)
+- [x] Quick Open / Close buttons
+- [x] Dark mode via `prefers-color-scheme`
+- [x] WiFi scan + hidden-SSID entry, configurable AP hotspot, AP toggle
+- [x] OTA `.bin` upload → inactive partition
+- [x] Factory reset
 
-### Remaining Core Verification
+### Known limitations we're carrying into 0.3.x
 
-Verified on a bare ESP32 devkit:
-- [x] Boots cleanly, no panics
-- [x] LED (GPIO 27) driven correctly when policy mode changes
-- [x] Portal reachable from a phone in both AP and STA modes
-- [x] Captive portal detection triggers on iOS / Android
-- [x] WiFi scan populates the SSID dropdown
-- [x] mDNS `OpenVent.local` resolves on the LAN
-- [x] Config-detect ADC reports 0 groups on a bare board (unpopulated pin)
-- [x] OTA upload from the portal writes to the inactive slot and reboots into it
+- **Hall thresholds** are hard-coded (raw ADC counts). Work for OldGuy's
+  board — unknown whether every board will match. Stock does a per-boot
+  ADC calibration; we don't. See [Phase 3](#phase-3--hall-sensor-calibration-parity).
+- **CLOSED** currently arrives on the mid-travel bump (~2260 raw) rather
+  than the true settled endpoint (~1374 raw). Mechanically OK because the
+  physical hard-stop lands at the same time, but semantically off. Tighten
+  the band once we understand the sensor curve better.
+- **RGB status LEDs** are not driven yet. Deferred beyond 0.3.x.
 
-Verified on real Panda Vent hardware (2026-07-07 field test — [notes](testing/2026-07-07-field-test-notes.md)):
-- [x] `openvent install` flashes cleanly over USB
-- [x] `openvent backup` + `openvent restore` round-trips the stock image
-- [x] Captive portal + WiFi provisioning workflow
-- [x] Motor drive direction correct — vents physically open on command
-- [x] Hall sensors report values (endpoint bands were mislabeled — fixed in v0.2.1)
-- [x] Stock firmware restore is fully non-destructive
+## Phase 2 — Deeper Moonraker Integration & Auto Logic (v0.3.0)
 
-Still to verify on hardware:
-- [ ] "Arrived at endpoint" detection works with the corrected hall labels (motor stops instead of chugging into the retry loop)
-- [ ] Vents close on command (was blocked by same label bug)
-- [ ] Confirm which mainboard chain maps to motor groups 0/1 vs 2/3
-- [ ] Confirm the 3-way config-detect ADC bands hit the expected raw values on the retail 2-vent kit
-- [ ] WS2812 outputs light up on the LED boards
-- [ ] Root-cause the intermittent AP dropouts observed during the field session
+Right now the "auto" policy is `printing OR bed>30 → OPEN`. That's enough
+to prove it works but ignores everything else Klipper knows. Goal for
+0.3.0: read Moonraker as richly as stock reads Bambu MQTT, and use that
+data to make smarter open/close decisions — including material-aware
+behavior (the tester's core ask).
 
-## Phase 2 — Firmware Parity (Web UI & Settings)
+### Moonraker ingest expansion (`pv_moonraker`)
+- [ ] Expand the initial subscribe: add `virtual_sdcard`, `webhooks`,
+      `display_status`, `extruder`, and optional `heater_generic chamber`
+      alongside the existing `print_stats` + `heater_bed`
+- [ ] Expose a `pv_printer_state_t` enum instead of a bare `printing`
+      bool — one of `IDLE`, `PREPARING`, `PRINTING`, `PAUSED`, `COMPLETE`,
+      `ERROR` (mirrors the six-state model stock uses on the Bambu side)
+- [ ] Track `webhooks.state` so Klipper shutdown / firmware-restart shows
+      as `ERROR` rather than "still printing"
 
-To match the stock BTT firmware capabilities, the following features must be implemented in the Web UI and backend:
+### Material awareness
+- [ ] Read Klipper `save_variables` (or a well-known gcode-macro variable
+      set from `PRINT_START`) to pick up the current material. The tester
+      already passes `MATERIAL=` into `PRINT_START` from his slicer, so
+      the ingest side is free
+- [ ] Configurable per-material rules in the portal: PLA → open above
+      45 °C bed, ABS/ASA → stay closed for heat retention, PETG → open
+      above 60 °C, etc. Ship sane defaults, let the user edit
+- [ ] Bed-temperature thresholds move from hard-coded to per-material
+      NVS-backed values (drop the current 35 / 45 °C constants)
+- [ ] Fallback rule when material is unknown (probably: current
+      bed-temperature hysteresis — what we do today)
 
-### Portal (Web UI)
-- [x] Tabbed layout — Home / WiFi / Printer / System (CSS-only, no JS)
-- [x] Persistent status card — firmware version, WiFi state + IP + RSSI, Moonraker state, printer state, bed temp, vent target, mode
-- [x] Quick-action Open / Close vent buttons on Home (same effect as short-press on the physical button)
-- [x] Dark mode via `prefers-color-scheme` (no toggle — follows OS setting)
+### Smarter auto policy (`pv_policy`)
+- [ ] Consume `pv_printer_state_t` — `COMPLETE` should keep the vent
+      open while the chamber is still hot (residual-heat handling),
+      `ERROR` should hold current state
+- [ ] Chamber-temp override when `heater_generic chamber` is present
+      (Voron-style enclosures)
+- [ ] Manual-mode target survives reboot (currently reset on power cycle)
 
-### Wi-Fi Page Parity
-- [x] Network scanner + selectable SSID dropdown (`pv_wifi_scan_start`)
-- [x] Manual SSID entry for hidden networks
-- [x] Connection status: IP + RSSI in the status card
+### Portal surfacing
+- [ ] Home tab shows printer state (with the six-state label), material,
+      progress %, chamber temp when available
+- [ ] Printer tab: material-rule editor, threshold sliders
+- [ ] Log/diagnostic tab that mirrors what `openvent-diag` sees — the
+      hall raw + state stream, motor drive events, Moonraker connection
+      health
 
-### AP Page Parity
-- [x] Configurable AP hotspot — SSID / password / IP (`pv_wifi_ap_config_t`)
-- [x] AP toggle — checkbox to disable AP fallback entirely (with lockout warning)
-- [x] Apply & reboot on save (`pv_wifi_set_ap_config_and_reboot`)
+### Verification before tagging 0.3.0
+- [ ] All of the above tested on local devkit for logic correctness
+- [ ] Full print cycle run on tester's real hardware — PLA and ABS at
+      minimum, ideally with a paused / resumed print thrown in
+- [ ] `openvent-diag` capture across a whole print, shared for review
 
-### Printer (Moonraker) Page Parity
-- [ ] Printer discovery: tried mDNS `_moonraker._tcp` (most Klipper installs don't advertise it) and then a subnet TCP-connect sweep (unreliable on real LANs). Both removed. Users configure host/port manually. Worth revisiting later with better probing.
+## Phase 3 — Hall Sensor Calibration Parity
 
-### System Page Parity
-- [x] OTA updates: `.bin` upload via web UI, streams directly into the inactive OTA partition
-- [x] Factory reset: web UI button (in Danger Zone) — clears WiFi / Moonraker / policy NVS and reboots
-- [x] Firmware version: shown in status card (from `esp_app_get_description`)
-- [ ] Language toggle: English / Simplified Chinese (optional; not needed for functional parity)
+Stock does something we don't: per-boot ADC calibration on the hall
+sensors, then interprets thresholds in millivolts rather than raw counts.
+Our first attempt at this in v0.2.4 broke real hardware (LEDs went red,
+device hung) — probably because the calibration pass raced with the
+WS2812 output on the shared ADC/GPIO domain. Reverted in v0.2.5.
 
-### Vent Button Parity (Minor Adjustments)
-- [x] Single-click in AUTO immediately switches to MANUAL and reverses vent state (`app_main:on_button`)
-- [x] Long-press mode switch (3 s per stock v1.0.0 binary `DAT_400d0948 = 2999 × 10 ms` and shipped user manual; the [BTT wiki](https://neo.bttwiki.com/en/docs/panda-series/module/panda-vent/panda-vent-firmware) says 6 s but v1.0.0 is the only released firmware — the wiki appears aspirational)
-- [x] Status LED matches stock: OFF during AUTO, blinking during MANUAL (`app_main:reflect_mode_on_led`)
+Not scheduled for a specific release — needs enough Ghidra time to
+understand *what* stock actually does before we try again.
 
-## Phase 3 — Firmware Parity (RGB Lighting & Themes)
+- [ ] Re-audit `adc_cali_raw_to_voltage` call sites in the stock binary:
+      when is calibration performed (once at boot? on demand?), which
+      channels are calibrated, and what's the exact scheme (line-fitting
+      vs curve-fitting)
+- [ ] Identify why our v0.2.4 attempt collided with the LED strip: shared
+      RTC/ADC block? contention on GPIO 4/14 (ADC2)?
+- [ ] Document threshold values in millivolts once we can convert
+      OldGuy's captured raw values through the calibration curve
+- [ ] Re-attempt calibration in a way that provably doesn't touch the
+      WS2812 pins during startup
+- [ ] Ship as a firmware-transparent change: user shouldn't need to
+      recalibrate manually, and existing configs should still work
 
-The stock firmware relies heavily on RGB status lighting via WS2812 strips. This requires implementing the `pv_rgb` RMT driver and a complex effects engine.
+## Phase 4 — RGB Lighting (deferred)
 
-### RGB Driver & Core
-- [ ] WS2812 LED strip driver via RMT
-- [ ] Auto-detect strip count (1 strip = 16 LEDs, 2 strips = 27 LEDs) via ADC on GPIO 35
+WS2812 status lighting is the biggest gap vs stock. Out of scope until
+the Moonraker + calibration work has landed and stabilized. Rough sketch
+of what's needed when we do get here:
 
-### Theme Page (Control UI)
-- [ ] Main Light Switch: Global toggle for all RGB effects
-- [ ] Warning Override Switch: Flash red globally on printer error (overrides all effects)
-- [ ] Behavior Toggles: "Follow Printer Mode" (colors match state) vs "Follow Exhaust Vent" (colors match vent open/close)
-- [ ] Reverse Direction: Toggle to reverse the flow of LED effects
+- WS2812 RMT driver, strip-count auto-detect via GPIO 35 ADC
+- Simple mode: 7 canned effects with color/brightness/speed sliders
+- Advanced mode: per-state color mapping (six printer states)
+- Warning override (flash red on printer error)
+- "Follow printer" / "Follow exhaust vent" / "Reverse direction" toggles
 
-### Light Modes Engine
-- [ ] **Simple Mode**: Fixed effect applied to all LEDs. 
-  - Support 7 effects: Solid, Breathing, Flash, Flow, Marquee, Rainbow Cycle, Multicolor.
-  - Support adjustable Color, Brightness (0-100%), Speed (0-100%).
-- [ ] **Advance Mode (H2D)**: State-machine-driven effects based on Moonraker status.
-  - Configure distinct effect, color, brightness, and speed for each state: Idle, Preparing, Printing, Paused, Complete, Error.
-- [ ] **Warning Hot Mode**: Temperature-driven effects based on Moonraker `heater_bed` or `extruder`.
-  - Safe State (Green) vs Danger State (Red).
-  - Support static or flashing effects with adjustable brightness and speed.
+## Phase 5 — Extras & Polish
 
-## Phase 4 — Extras & Polish
-
-- [ ] Print progress on LEDs (percentage bar using Moonraker `display_status` / `virtual_sdcard`)
-- [ ] Klipper macro integration (allow macros to explicitly control vent/LEDs via custom endpoints)
-- [ ] Home Assistant / MQTT bridge (optional fallback for non-Moonraker setups)
+- [ ] Print progress on LEDs (once RGB lands)
+- [ ] Klipper macro integration — expose HTTP endpoints so gcode macros
+      can explicitly command vent open/close and RGB effects
+- [ ] Home Assistant / MQTT bridge (optional fallback for non-Moonraker
+      setups)
+- [ ] Simplified Chinese portal translation (stock feature; low priority)
 
 ## Architecture
 
-Firmware is split into standalone ESP-IDF components under `firmware/components/`.
-`app_main` is a thin orchestrator: boot each service in order, register the
-button callback, mirror policy mode to the LED.
+Firmware is split into standalone ESP-IDF components under
+`firmware/components/`. `app_main` is a thin orchestrator: boot each
+service in order, register the button callback, mirror policy mode to
+the LED.
 
 ```
                     ┌─────────────────────────────┐
     printer ─── ws ──┤  pv_moonraker  (WS client)  │
-                     │  print_stats, heater_bed    │
+                     │  state, temps, material     │
                      └──────────┬──────────────────┘
                                 │ status
                                 ▼
@@ -157,9 +182,10 @@ button callback, mirror policy mode to the LED.
                                      ▼
                                   pv_wifi (STA + AP fallback)
 
-    pv_board = pin definitions shared by every component (single source of truth)
+    pv_board = pin definitions shared by every component
 ```
 
-Every long-lived component owns its own FreeRTOS task and exposes a thread-safe
-API. Shared state (WiFi/Moonraker/policy) lives in the `app_nvs` NVS namespace
-so it survives reboots and is compatible with the stock firmware's layout.
+Every long-lived component owns its own FreeRTOS task and exposes a
+thread-safe API. Shared state (WiFi/Moonraker/policy) lives in the
+`app_nvs` NVS namespace so it survives reboots and is compatible with
+the stock firmware's layout.

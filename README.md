@@ -6,15 +6,27 @@ Custom firmware for the [Bigtreetech Panda Vent](https://github.com/bigtreetech/
 
 The Panda Vent is a smart vent riser for enclosed 3D printers. The stock firmware only works with Bambu Lab printers via their proprietary MQTT protocol. OpenVent replaces that firmware so the hardware works with any Klipper-based printer via Moonraker's API.
 
-## Features (Planned)
+## Features
 
-- **Automatic vent control** — opens/closes based on bed temperature and print status
+Working today (v0.2.6):
+
+- **Automatic vent control** — opens/closes based on print state + bed-temp hysteresis
 - **Captive portal WiFi setup** — same UX as the stock firmware
-- **Moonraker integration** — connects via WebSocket for real-time printer status
+- **Moonraker integration** — WebSocket connection to `print_stats` + `heater_bed`
 - **Physical button control** — auto/manual mode toggle, manual vent override
-- **Web configuration UI** — Moonraker connection, vent settings
+- **Web configuration UI** — tabbed layout for WiFi, Moonraker, and system
 - **OTA firmware updates** — flash new firmware from the web UI
-- **RGB LED status** (Phase 2) — printer state visualization via WS2812 strips
+
+Coming in the 0.3.x series:
+
+- **Richer Moonraker ingest** — full six-state printer model, live push updates, chamber temp
+- **Material-aware auto mode** — PLA opens for cooling, ABS/ASA seals for heat retention, read from `PRINT_START`
+- **Configurable thresholds** — per-material bed-temp rules editable in the portal
+
+Deferred:
+
+- **Per-boot hall calibration** — stock does this in millivolts; our first attempt broke real hardware. Needs more Ghidra time before we retry
+- **RGB LED status** — WS2812 driver + effects engine, planned for after the Moonraker + calibration work stabilizes
 
 ## Documentation
 
@@ -51,21 +63,19 @@ autodetect doesn't find the right port.)
 
 ## Status
 
-**First real-hardware field test happened on 2026-07-07**
-([notes](docs/testing/2026-07-07-field-test-notes.md)). First-time flash,
-UI, captive portal, and stock-firmware restore all worked. Motors drove
-in the correct direction but the "arrived at endpoint" check was fooled
-by inverted hall thresholds — fixed in v0.2.1 pending re-verification.
+**v0.2.6 is the first stable proof-of-concept release.** 2026-07-10 field
+test on tester OldGuyMeltsPlastic's retail 2-vent kit: 10× consecutive
+open/close cycles, no ESP crash, motor stops cleanly on each arrival.
+See [ROADMAP.md](docs/ROADMAP.md) for what's shipped and what's next.
 
 - ✅ Firmware flashes on real Panda Vent hardware; `openvent` script for
   backup / restore / install works end-to-end
 - ✅ WiFi station + AP fallback, mDNS `OpenVent.local`, captive portal
 - ✅ Portal: tabbed UI, live status, WiFi setup, Moonraker config, OTA upload, factory reset, dark mode
 - ✅ Moonraker WebSocket client with `print_stats` + `heater_bed` subscriptions
-- ✅ Physical button and status LED wired to the mode state machine
-- ✅ Motors drive in the correct direction on real hardware; vents physically open on command
-- ⏳ Hall-endpoint detection labels corrected 2026-07-07 (v0.2.1) — re-verification pending
-- ⬜ Not yet verified on hardware: WS2812 outputs, exact ADC bands for the config-detect line
+- ✅ Motors drive both directions and reliably stop at endpoints
+- ⏳ 0.3.0 in progress: full six-state printer model + material-aware auto
+- ⬜ Deferred: WS2812 RGB, per-boot hall calibration
 
 [![Buy Me A Coffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/wildtang3nt)
 

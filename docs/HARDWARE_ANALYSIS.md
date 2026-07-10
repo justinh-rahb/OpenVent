@@ -143,12 +143,19 @@ references in stock's binary at `3f42a91c` / `3f42a934`).
 | 3      | past-closed / over-travel      | `mv + (-2080) < 0x173` (~2080–2450 mV) |
 | 4      | in transit (catch-all)         | anything else                    |
 
-> **Note (v0.2.5):** OpenVent temporarily uses raw ADC counts with a widened
-> OPEN band because initialising `adc_cali_create_scheme_line_fitting` on real
-> Panda Vent hardware disrupted shared ADC/GPIO state in v0.2.4 (WS2812 strips
-> on GPIO 4 / GPIO 14 latched red at boot; the board hung after repeated motor
-> commands). We plan to reintroduce calibration once the interaction is
-> understood — the OPEN band widening is a stop-gap until then.
+> **Note (v0.2.6):** OpenVent uses raw ADC counts with widened bands and a
+> 30 ms arrival debounce, rather than the calibrated-millivolt thresholds
+> stock uses. Initialising `adc_cali_create_scheme_line_fitting` at boot
+> broke real hardware in v0.2.4 — WS2812 strips on GPIO 4 / GPIO 14 latched
+> red and the board hung after repeated motor commands — so we reverted in
+> v0.2.5 and shipped the raw-counts approach in v0.2.6. Reintroducing
+> per-boot calibration is tracked as Phase 3 in the [roadmap](ROADMAP.md);
+> we need to re-audit exactly when and how stock does it before retrying.
+> Field data from v0.2.6 shows CLOSED settles ~1374 raw and OPEN ~640 raw
+> on OldGuy's board, with a non-monotonic peak ~2260 raw mid-travel that
+> the widened CLOSED band tolerates (arrival happens on the peak, but the
+> physical hard-stop lands at the same moment so the vent still closes
+> fully).
 
 Direction of "OPEN" vs "CLOSED" was derived from the main state machine
 (`FUN_400de55c`, lines 36–43): stock reads the user's fan-on/off intent
