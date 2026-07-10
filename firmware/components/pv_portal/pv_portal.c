@@ -18,9 +18,11 @@
 #include "freertos/task.h"
 #include "lwip/inet.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 static const char *TAG = "pv_portal";
 
@@ -819,6 +821,76 @@ static esp_err_t handle_ota_post(httpd_req_t *req)
     return ESP_OK;   // unreachable
 }
 
+// Tasmota-compatible power endpoint. Lets users control the vent from Klipper
+// gcode by adding this to moonraker.conf:
+//
+//     [power vent]
+//     type: tasmota
+//     address: OpenVent.local
+//
+// then calling `POWER_ON vent` / `POWER_OFF vent` from a macro. Also gives
+// them a toggle in Mainsail/Fluidd's Power panel for free.
+//
+// Semantics match a portal quick-action button: force MANUAL and drive to
+// the requested state. POWER_OFF does NOT return to AUTO — the user opts
+// back in via the physical short-press or the portal Mode form.
+//
+// Endpoints implemented:
+//   GET /cm?cmnd=Power       -> status query, no state change
+//   GET /cm?cmnd=Power%20ON  -> manual OPEN
+//   GET /cm?cmnd=Power%20OFF -> manual CLOSED
+//   GET /cm?cmnd=Power%20TOGGLE
+//
+// Multi-relay variants (`Power1`, `Power2` …) are accepted with any digit
+// suffix so Moonraker configs specifying an output_id still work; we're a
+// single relay so they all target the same vent.
+static esp_err_t handle_tasmota_cm(httpd_req_t *req)
+{
+    char cmnd[32] = "";
+    size_t qlen = httpd_req_get_url_query_len(req);
+    if (qlen > 0) {
+        char query[128];
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+            // form_get handles URL-decoding of %20 / '+' so "Power%20ON"
+            // arrives here as "Power ON".
+            form_get(query, "cmnd", cmnd, sizeof(cmnd));
+        }
+    }
+
+    // Skip the "Power" verb and optional digit suffix; leave the argument.
+    const char *arg = cmnd;
+    if (strncasecmp(arg, "Power", 5) == 0) {
+        arg += 5;
+        while (isdigit((unsigned char)*arg)) arg++;
+        while (*arg == ' ') arg++;
+    }
+
+    pv_motor_target_t current = pv_policy_get_target();
+    bool want_on;
+    if (strcasecmp(arg, "ON") == 0) {
+        want_on = true;
+    } else if (strcasecmp(arg, "OFF") == 0) {
+        want_on = false;
+    } else if (strcasecmp(arg, "TOGGLE") == 0) {
+        want_on = (current != PV_MOTOR_TARGET_OPEN);
+    } else {
+        // No/unknown arg -> pure status query; report current position
+        // without touching state.
+        want_on = (current == PV_MOTOR_TARGET_OPEN);
+        goto respond;
+    }
+
+    pv_motor_target_t t = want_on ? PV_MOTOR_TARGET_OPEN : PV_MOTOR_TARGET_CLOSED;
+    pv_policy_set_manual_target(t);
+    pv_policy_set_mode(PV_POLICY_MODE_MANUAL);
+    pv_evlog_add("tasmota: POWER %s", want_on ? "ON" : "OFF");
+
+respond:
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req,
+        want_on ? "{\"POWER\":\"ON\"}" : "{\"POWER\":\"OFF\"}");
+}
+
 static esp_err_t handle_factory_reset_post(httpd_req_t *req)
 {
     ESP_LOGW(TAG, "factory reset requested from portal");
@@ -913,6 +985,7 @@ esp_err_t pv_portal_start(void)
     httpd_uri_t vent  = { .uri = "/vent",       .method = HTTP_POST, .handler = handle_vent_post };
     httpd_uri_t ota   = { .uri = "/ota",        .method = HTTP_POST, .handler = handle_ota_post };
     httpd_uri_t reset = { .uri = "/factory_reset", .method = HTTP_POST, .handler = handle_factory_reset_post };
+    httpd_uri_t cm    = { .uri = "/cm",          .method = HTTP_GET,  .handler = handle_tasmota_cm };
     httpd_register_uri_handler(s_httpd, &root);
     httpd_register_uri_handler(s_httpd, &wifi);
     httpd_register_uri_handler(s_httpd, &scan);
@@ -923,6 +996,7 @@ esp_err_t pv_portal_start(void)
     httpd_register_uri_handler(s_httpd, &vent);
     httpd_register_uri_handler(s_httpd, &ota);
     httpd_register_uri_handler(s_httpd, &reset);
+    httpd_register_uri_handler(s_httpd, &cm);
 
     // Kick off an initial WiFi scan so the SSID dropdown has entries by the
     // time the user loads the page.
