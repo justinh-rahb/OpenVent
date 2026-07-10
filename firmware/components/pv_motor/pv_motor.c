@@ -29,26 +29,29 @@ static const char *TAG = "pv_motor";
 #define MAX_RETRIES         4
 #define TICK_MS             10                  // task loop period
 
-// Hall thresholds — raw ADC counts. Compared directly against the value from
-// adc_oneshot_read; no calibration in the loop.
+// Hall thresholds — raw ADC counts. The 2026-07-10 diag capture showed that on
+// this board the hall response *is not monotonic* across the flap's travel:
+//   OPEN endpoint    → raw ~613
+//   mid-travel       → raw peaks ~2100+ (what stock labelled "state 3")
+//   CLOSED endpoint  → raw ~1374
+// So the raw value rises through the CLOSED band, keeps going up to a bump,
+// then falls back down as the flap reaches its physical closed stop. Our
+// original narrow CLOSED band [0x550..0x690) was missing both the "on the way
+// past" sample and the settled sample.
 //
-// Stock's hall_get_state runs the raw sample through adc_cali_raw_to_voltage
-// before comparing, but the v0.2.4 field test showed that enabling calibration
-// somehow disrupted shared ADC/GPIO state on the real BTT board — WS2812 strips
-// on ADC2 pins (GPIO 4 / GPIO 14) latched garbage red at boot and the board
-// hung on repeated motor commands. Backing out cali until we understand why.
-//
-// The CLOSED band matched real hardware at the 2026-07-07 test, so we keep it
-// tight. The OPEN band from stock (0x280..0x3c0) missed the tester's actual
-// reading, so we widen it aggressively to any raw value clearly below CLOSED —
-// on a hall sensor the two endpoints sit at opposite voltage rails, so
-// mid-travel readings look nothing like the endpoints.
-#define HALL_OPEN_LO        0x100      // ~90 mV worth of headroom below OPEN
-#define HALL_OPEN_HI        0x500      // stop short of CLOSED (0x550)
-#define HALL_CLOSED_LO      0x550
-#define HALL_CLOSED_HI      0x690
+// Two-band split with an arrival debounce (see ARRIVED_DEBOUNCE_TICKS): anything
+// clearly below the crossover point is OPEN, anything above is CLOSED. Requiring
+// N consecutive samples in the target band before declaring arrival keeps a
+// single mid-travel spike from stopping the motor early.
+#define HALL_OPEN_LO        0x040      // ~15 mV headroom below reported OPEN
+#define HALL_OPEN_HI        0x500      // 1280 — clearly below any CLOSED reading
+#define HALL_CLOSED_LO      0x540      // 1344 — includes the settled CLOSED
+#define HALL_CLOSED_HI      0xa00      // 2560 — includes the mid-travel bump so
+                                       //         we don't miss the moment the
+                                       //         flap crosses the endpoint
+#define ARRIVED_DEBOUNCE_TICKS 3       // 30 ms of continuous in-band samples
 #define HALL_MID_LOW_TEST   0x173
-#define HALL_MID_OFFSET     (-2080)    // signed; 0xfffff7e0 as int32
+#define HALL_MID_OFFSET     (-2080)    // kept for parity with stock's state 3 test
 
 // Config-detect thresholds — from stock's FUN_400deb88. Three bands with
 // deliberate gaps: readings in the gaps mean "keep current config".
@@ -75,8 +78,9 @@ typedef struct {
     dir_t             dir;         // channel currently energised
     bool              running;
     int               retries;
+    int               arrived_consec;      // consecutive ticks reading target
+    bool              gave_up;             // exhausted retries; wait for new target
     TickType_t        drive_started_tick;
-    TickType_t        last_diag_tick;      // last time we logged hall raw+state
     pv_motor_hall_t   hall_cached;
 } group_state_t;
 
@@ -314,40 +318,63 @@ static void tick_group(int g)
     pv_motor_hall_t hall = read_hall(g);
     st->hall_cached = hall;
 
-    // Diagnostic: while a group is actively driving, log raw ADC + classified
-    // state every second. Lets us see exactly what values the hall reports at
-    // each endpoint on a given board without a probe.
+    // Diagnostic: while a group is actively driving, log every sample so we
+    // can see the whole trajectory (the 2026-07-10 diag caught a non-monotonic
+    // hall response that a 1 Hz log would have missed).
     if (st->running) {
-        TickType_t now = xTaskGetTickCount();
-        if (now - st->last_diag_tick >= pdMS_TO_TICKS(1000)) {
-            st->last_diag_tick = now;
-            ESP_LOGI(TAG, "grp=%d driving (want=%s) hall_raw=%d hall_state=%d",
-                     g,
-                     want == PV_MOTOR_TARGET_OPEN   ? "OPEN"
-                   : want == PV_MOTOR_TARGET_CLOSED ? "CLOSED" : "STOP",
-                     s_hall_raw_last[g], (int)hall);
-        }
+        ESP_LOGI(TAG, "grp=%d driving (want=%s) hall_raw=%d hall_state=%d",
+                 g,
+                 want == PV_MOTOR_TARGET_OPEN   ? "OPEN"
+               : want == PV_MOTOR_TARGET_CLOSED ? "CLOSED" : "STOP",
+                 s_hall_raw_last[g], (int)hall);
     }
 
     // Stop requested.
     if (want == PV_MOTOR_TARGET_STOP) {
         if (st->running) stop_drive(g);
-        st->applied = PV_MOTOR_TARGET_STOP;
-        st->retries = 0;
+        st->applied  = PV_MOTOR_TARGET_STOP;
+        st->retries  = 0;
+        st->arrived_consec = 0;
+        st->gave_up  = false;
         return;
     }
 
-    // Already at target — nothing to do.
+    // Target changed since last drive → clear state and (re)start.
+    if (st->applied != want) {
+        st->retries        = 0;
+        st->arrived_consec = 0;
+        st->gave_up        = false;
+        begin_drive_toward(g, want);
+        return;
+    }
+
+    // Already at (or matched to) the target hall band. Debounce so a single
+    // mid-travel spike doesn't stop us early.
     if (hall == hall_for_target(want)) {
-        if (st->running) stop_drive(g);
-        st->applied = want;
-        st->retries = 0;
+        st->arrived_consec++;
+        if (st->arrived_consec >= ARRIVED_DEBOUNCE_TICKS) {
+            if (st->running) {
+                ESP_LOGI(TAG, "grp=%d arrived (want=%s hall_raw=%d hall_state=%d)",
+                         g,
+                         want == PV_MOTOR_TARGET_OPEN ? "OPEN" : "CLOSED",
+                         s_hall_raw_last[g], (int)hall);
+                stop_drive(g);
+            }
+            st->retries = 0;
+        }
         return;
     }
+    // Not on target this sample — reset the debounce counter.
+    st->arrived_consec = 0;
 
-    // Target changed since last drive → restart in the new direction.
-    if (!st->running || st->applied != want) {
-        st->retries = 0;
+    // If we've given up on this target, stay stopped until pv_policy asks for
+    // something different. Prevents the "retry forever after MAX_RETRIES" loop
+    // that the field test caught (probably brownout root cause).
+    if (st->gave_up) return;
+
+    // Motor may have been stopped by give-up on the previous cycle. Kick it
+    // back on if the target still wants motion.
+    if (!st->running) {
         begin_drive_toward(g, want);
         return;
     }
@@ -371,7 +398,7 @@ static void tick_group(int g)
                : want == PV_MOTOR_TARGET_CLOSED ? "CLOSED" : "STOP",
                  s_hall_raw_last[g], (int)hall);
         stop_drive(g);
-        // Leave target intact — the caller can decide to re-issue.
+        st->gave_up = true;
     }
 }
 

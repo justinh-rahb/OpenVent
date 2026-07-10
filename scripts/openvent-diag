@@ -107,7 +107,14 @@ def main():
 
     try:
         while True:
-            raw = s.readline()
+            try:
+                raw = s.readline()
+            except serial.SerialException as e:
+                # ESP crashed / USB dropped mid-capture — treat as Ctrl-C so
+                # the summary still gets printed with whatever we captured.
+                print(f"\n!! serial disconnected: {e}")
+                print("!! (device probably crashed or reset — summary below)\n")
+                break
             if not raw:
                 continue
             line = ANSI_RE.sub("", raw.decode("utf-8", errors="replace")).rstrip()
