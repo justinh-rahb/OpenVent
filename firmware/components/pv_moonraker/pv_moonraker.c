@@ -8,6 +8,8 @@
 #include "freertos/task.h"
 #include "nvs.h"
 
+#include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -24,12 +26,38 @@ static const char *TAG = "pv_moonraker";
 #define NETWORK_TIMEOUT_MS     10000
 #define RECONNECT_TIMEOUT_MS   5000
 
+// Progress below this counts as "PREPARING" rather than "PRINTING", matching
+// stock's Bambu "PREPARE" state (downloading / slicing / warming up).
+#define PREPARING_PROGRESS_MAX 0.01f
+
 static SemaphoreHandle_t         s_lock  = NULL;
 static esp_websocket_client_handle_t s_ws = NULL;
 static pv_moonraker_config_t     s_cfg   = {0};
-static pv_moonraker_status_t     s_status = { .state = PV_MK_DISABLED };
+static pv_moonraker_status_t     s_status = {
+    .state = PV_MK_DISABLED,
+    .chamber_temp = NAN,
+};
 static char                     *s_rx_buf = NULL;
 static size_t                    s_rx_off = 0;
+
+// Latest raw Klipper values seen so we can re-derive the six-state model
+// whenever any of them changes.
+static char  s_ps_state[16]     = "";   // print_stats.state
+static char  s_wh_state[16]     = "";   // webhooks.state
+static float s_last_progress    = 0.0f;
+
+const char *pv_printer_state_str(pv_printer_state_t s)
+{
+    switch (s) {
+    case PV_PRINTER_IDLE:      return "idle";
+    case PV_PRINTER_PREPARING: return "preparing";
+    case PV_PRINTER_PRINTING:  return "printing";
+    case PV_PRINTER_PAUSED:    return "paused";
+    case PV_PRINTER_COMPLETE:  return "complete";
+    case PV_PRINTER_ERROR:     return "error";
+    default:                   return "unknown";
+    }
+}
 
 // ---------- NVS ----------
 
@@ -67,7 +95,64 @@ static esp_err_t nvs_save(const pv_moonraker_config_t *cfg)
     return err;
 }
 
+// ---------- state derivation ----------
+
+// Fold the latest print_stats.state + webhooks.state + progress into our
+// six-state enum. Called under s_lock every time any of them changes.
+//
+// Rules (see docs/ROADMAP.md Phase 2):
+//   webhooks.state != "ready"          -> ERROR (Klipper down / shutdown)
+//   print_stats.state                  -> as follows
+//     "printing", progress < 1%        -> PREPARING
+//     "printing"                       -> PRINTING
+//     "paused"                         -> PAUSED
+//     "complete"                       -> COMPLETE
+//     "error" / "cancelled"            -> ERROR
+//     "standby" / ""                   -> IDLE
+static void recompute_printer_state(void)
+{
+    pv_printer_state_t st = PV_PRINTER_UNKNOWN;
+
+    if (s_wh_state[0] && strcmp(s_wh_state, "ready") != 0) {
+        st = PV_PRINTER_ERROR;
+    } else if (s_ps_state[0] == '\0' || strcmp(s_ps_state, "standby") == 0) {
+        st = PV_PRINTER_IDLE;
+    } else if (strcmp(s_ps_state, "printing") == 0) {
+        st = (s_last_progress < PREPARING_PROGRESS_MAX)
+                 ? PV_PRINTER_PREPARING
+                 : PV_PRINTER_PRINTING;
+    } else if (strcmp(s_ps_state, "paused") == 0) {
+        st = PV_PRINTER_PAUSED;
+    } else if (strcmp(s_ps_state, "complete") == 0) {
+        st = PV_PRINTER_COMPLETE;
+    } else if (strcmp(s_ps_state, "error") == 0 ||
+               strcmp(s_ps_state, "cancelled") == 0) {
+        st = PV_PRINTER_ERROR;
+    } else {
+        st = PV_PRINTER_IDLE;   // unknown Klipper state, treat as idle
+    }
+
+    if (st != s_status.printer) {
+        ESP_LOGI(TAG, "printer state: %s -> %s",
+                 pv_printer_state_str(s_status.printer),
+                 pv_printer_state_str(st));
+        s_status.printer = st;
+    }
+    s_status.printing = (st == PV_PRINTER_PRINTING);
+}
+
 // ---------- status parsing ----------
+
+// Copy a JSON string field into `dst` (uppercase) if present.
+static void copy_upper(char *dst, size_t dst_sz, const char *src)
+{
+    size_t i = 0;
+    while (src[i] && i < dst_sz - 1) {
+        dst[i] = (char)toupper((unsigned char)src[i]);
+        ++i;
+    }
+    dst[i] = '\0';
+}
 
 // Merge one status object (e.g. {"heater_bed":{"temperature":55.3}}) into the
 // cached status. Fields not present in the update are left untouched, matching
@@ -76,15 +161,43 @@ static void merge_status_object(cJSON *status)
 {
     if (!cJSON_IsObject(status)) return;
 
+    bool state_dirty = false;
+
     cJSON *print = cJSON_GetObjectItemCaseSensitive(status, "print_stats");
     if (cJSON_IsObject(print)) {
-        cJSON *state = cJSON_GetObjectItemCaseSensitive(print, "state");
-        if (cJSON_IsString(state)) {
-            s_status.printing = (strcmp(state->valuestring, "printing") == 0);
-            ESP_LOGI(TAG, "print_stats.state=%s (printing=%d)",
-                     state->valuestring, s_status.printing);
+        cJSON *ps = cJSON_GetObjectItemCaseSensitive(print, "state");
+        if (cJSON_IsString(ps)) {
+            strncpy(s_ps_state, ps->valuestring, sizeof(s_ps_state) - 1);
+            s_ps_state[sizeof(s_ps_state) - 1] = '\0';
+            state_dirty = true;
+        }
+        cJSON *fn = cJSON_GetObjectItemCaseSensitive(print, "filename");
+        if (cJSON_IsString(fn)) {
+            strncpy(s_status.filename, fn->valuestring, sizeof(s_status.filename) - 1);
+            s_status.filename[sizeof(s_status.filename) - 1] = '\0';
         }
     }
+
+    cJSON *wh = cJSON_GetObjectItemCaseSensitive(status, "webhooks");
+    if (cJSON_IsObject(wh)) {
+        cJSON *ws = cJSON_GetObjectItemCaseSensitive(wh, "state");
+        if (cJSON_IsString(ws)) {
+            strncpy(s_wh_state, ws->valuestring, sizeof(s_wh_state) - 1);
+            s_wh_state[sizeof(s_wh_state) - 1] = '\0';
+            state_dirty = true;
+        }
+    }
+
+    cJSON *vsd = cJSON_GetObjectItemCaseSensitive(status, "virtual_sdcard");
+    if (cJSON_IsObject(vsd)) {
+        cJSON *p = cJSON_GetObjectItemCaseSensitive(vsd, "progress");
+        if (cJSON_IsNumber(p)) {
+            s_last_progress = (float)p->valuedouble;
+            s_status.progress = s_last_progress;
+            state_dirty = true;   // affects PREPARING vs PRINTING
+        }
+    }
+
     cJSON *bed = cJSON_GetObjectItemCaseSensitive(status, "heater_bed");
     if (cJSON_IsObject(bed)) {
         cJSON *t = cJSON_GetObjectItemCaseSensitive(bed, "temperature");
@@ -92,6 +205,36 @@ static void merge_status_object(cJSON *status)
         cJSON *g = cJSON_GetObjectItemCaseSensitive(bed, "target");
         if (cJSON_IsNumber(g)) s_status.bed_target = (float)g->valuedouble;
     }
+
+    cJSON *ex = cJSON_GetObjectItemCaseSensitive(status, "extruder");
+    if (cJSON_IsObject(ex)) {
+        cJSON *t = cJSON_GetObjectItemCaseSensitive(ex, "temperature");
+        if (cJSON_IsNumber(t)) s_status.extruder_temp = (float)t->valuedouble;
+    }
+
+    // Chamber: subscribed as "heater_generic chamber". Not every install has
+    // it — cJSON just returns NULL and we leave chamber_temp as NaN.
+    cJSON *chamber = cJSON_GetObjectItemCaseSensitive(status, "heater_generic chamber");
+    if (cJSON_IsObject(chamber)) {
+        cJSON *t = cJSON_GetObjectItemCaseSensitive(chamber, "temperature");
+        if (cJSON_IsNumber(t)) s_status.chamber_temp = (float)t->valuedouble;
+    }
+
+    // Material: read from save_variables.variables.material. Users opt in by
+    // adding `SAVE_VARIABLE VARIABLE=material VALUE='"{material}"'` to their
+    // PRINT_START macro. Uppercased so PLA/pla/Pla all compare equal.
+    cJSON *sv = cJSON_GetObjectItemCaseSensitive(status, "save_variables");
+    if (cJSON_IsObject(sv)) {
+        cJSON *vars = cJSON_GetObjectItemCaseSensitive(sv, "variables");
+        if (cJSON_IsObject(vars)) {
+            cJSON *m = cJSON_GetObjectItemCaseSensitive(vars, "material");
+            if (cJSON_IsString(m)) {
+                copy_upper(s_status.material, sizeof(s_status.material), m->valuestring);
+            }
+        }
+    }
+
+    if (state_dirty) recompute_printer_state();
 }
 
 // A complete Moonraker JSON-RPC frame has arrived. Route it.
@@ -112,7 +255,10 @@ static void handle_frame(const char *json, size_t len)
             merge_status_object(status);
             s_status.state = PV_MK_SUBSCRIBED;
             xSemaphoreGive(s_lock);
-            ESP_LOGI(TAG, "subscribed; got initial status");
+            ESP_LOGI(TAG, "subscribed; initial state=%s bed=%.1f material=%s",
+                     pv_printer_state_str(s_status.printer),
+                     s_status.bed_temp,
+                     s_status.material[0] ? s_status.material : "?");
         }
         cJSON_Delete(root);
         return;
@@ -137,10 +283,23 @@ static void handle_frame(const char *json, size_t len)
 
 static void send_subscribe(void)
 {
-    // Ask for print_stats + heater_bed, no field filter.
+    // Objects mirror what stock reads off Bambu MQTT — enough to derive the
+    // six-state printer model plus bed / extruder / chamber temps, print
+    // progress, and material (via save_variables). Klipper silently omits
+    // objects that don't exist on this printer, so subscribing to
+    // "heater_generic chamber" / "save_variables" is safe if the user
+    // doesn't have them.
     const char *req =
         "{\"jsonrpc\":\"2.0\",\"method\":\"printer.objects.subscribe\","
-        "\"params\":{\"objects\":{\"print_stats\":null,\"heater_bed\":null}},"
+        "\"params\":{\"objects\":{"
+            "\"webhooks\":null,"
+            "\"print_stats\":null,"
+            "\"virtual_sdcard\":null,"
+            "\"heater_bed\":null,"
+            "\"extruder\":null,"
+            "\"heater_generic chamber\":null,"
+            "\"save_variables\":null"
+        "}},"
         "\"id\":1}";
     int sent = esp_websocket_client_send_text(s_ws, req, strlen(req),
                                               pdMS_TO_TICKS(NETWORK_TIMEOUT_MS));
@@ -187,6 +346,12 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     case WEBSOCKET_EVENT_ERROR:
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_status.state = PV_MK_DISCONNECTED;
+        // A dropped websocket says nothing about the printer itself, but we
+        // also can't trust our cached state to still be current. Fall back
+        // to UNKNOWN so pv_policy holds current target instead of acting on
+        // stale data.
+        s_status.printer = PV_PRINTER_UNKNOWN;
+        s_status.printing = false;
         xSemaphoreGive(s_lock);
         break;
     default: break;
@@ -295,4 +460,3 @@ esp_err_t pv_moonraker_clear_config(void)
     nvs_close(h);
     return ESP_OK;
 }
-

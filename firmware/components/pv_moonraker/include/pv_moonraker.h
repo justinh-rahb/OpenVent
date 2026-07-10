@@ -1,8 +1,8 @@
 #pragma once
 
 // Moonraker WebSocket client. Reads its config from NVS at boot, connects to
-// `ws://<host>:<port>/websocket`, subscribes to print_stats + heater_bed, and
-// caches the latest values for the vent policy to consult. Reconnects on
+// `ws://<host>:<port>/websocket`, subscribes to a fixed set of printer objects,
+// and caches the latest values for the vent policy to consult. Reconnects on
 // disconnect. Idle (no-op) if no config is saved.
 
 #include <stdbool.h>
@@ -16,6 +16,21 @@ typedef enum {
     PV_MK_SUBSCRIBED,     // receiving status updates
 } pv_moonraker_state_t;
 
+// Six-state printer model mirroring what stock reads off Bambu MQTT. Derived
+// from a combination of print_stats.state and webhooks.state so a hard
+// Klipper error shows as ERROR rather than a stale "printing".
+typedef enum {
+    PV_PRINTER_UNKNOWN = 0,
+    PV_PRINTER_IDLE,       // standby / ready, no active print
+    PV_PRINTER_PREPARING,  // print started but early (progress < ~1%)
+    PV_PRINTER_PRINTING,   // actively printing
+    PV_PRINTER_PAUSED,
+    PV_PRINTER_COMPLETE,   // last print finished cleanly
+    PV_PRINTER_ERROR,      // print_stats "error"/"cancelled", or Klipper shutdown
+} pv_printer_state_t;
+
+const char *pv_printer_state_str(pv_printer_state_t s);
+
 typedef struct {
     char     host[64];    // hostname or IP; empty string = unconfigured
     uint16_t port;        // defaults to 7125 if 0
@@ -24,9 +39,15 @@ typedef struct {
 
 typedef struct {
     pv_moonraker_state_t state;
-    bool                 printing;    // print_stats.state == "printing"
-    float                bed_temp;    // heater_bed.temperature (°C)
-    float                bed_target;  // heater_bed.target (°C)
+    pv_printer_state_t   printer;      // six-state model
+    bool                 printing;     // convenience: printer == PRINTING
+    float                bed_temp;     // heater_bed.temperature (°C)
+    float                bed_target;   // heater_bed.target (°C)
+    float                extruder_temp;// extruder.temperature (°C, informational)
+    float                chamber_temp; // heater_generic chamber, if present; NaN if absent
+    float                progress;     // 0..1 from virtual_sdcard.progress
+    char                 filename[64]; // print_stats.filename
+    char                 material[16]; // from save_variables.material or gcode metadata; upper-case
 } pv_moonraker_status_t;
 
 esp_err_t pv_moonraker_start(void);

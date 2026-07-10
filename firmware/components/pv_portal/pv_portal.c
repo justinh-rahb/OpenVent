@@ -9,6 +9,8 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_ota_ops.h"
+
+#include <math.h>
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -228,21 +230,36 @@ static esp_err_t send_status(httpd_req_t *req)
     char wifi_line[96];
     gather_wifi_detail(wifi_line, sizeof(wifi_line));
 
-    char buf[768];
+    // Optional pieces — only rendered if the printer actually reports them.
+    char material_line[64] = "";
+    if (mk.material[0]) {
+        snprintf(material_line, sizeof(material_line),
+                 "<div><b>Material:</b> %s</div>", mk.material);
+    }
+    char chamber_line[64] = "";
+    if (!isnan(mk.chamber_temp)) {
+        snprintf(chamber_line, sizeof(chamber_line),
+                 "<div><b>Chamber:</b> %.1f\xC2\xB0""C</div>", mk.chamber_temp);
+    }
+
+    char buf[1024];
     snprintf(buf, sizeof(buf),
         "<div class=\"status\">"
         "<div><b>Firmware:</b> %s</div>"
         "<div><b>WiFi:</b> %s</div>"
         "<div><b>Moonraker:</b> %s</div>"
-        "<div><b>Printer state:</b> %s (bed %.1f\xC2\xB0""C)</div>"
+        "<div><b>Printer:</b> %s (bed %.1f\xC2\xB0""C)</div>"
+        "%s%s"
         "<div><b>Vent target:</b> %s</div>"
         "<div><b>Mode:</b> %s</div>"
         "</div>",
         app->version,
         wifi_line,
         mk_label(mk.state),
-        mk.printing ? "printing" : "idle",
+        pv_printer_state_str(mk.printer),
         mk.bed_temp,
+        material_line,
+        chamber_line,
         target_label(pv_policy_get_target()),
         pv_policy_get_mode() == PV_POLICY_MODE_MANUAL ? "MANUAL" : "AUTO");
     return SEND(req, buf);
