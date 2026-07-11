@@ -153,6 +153,7 @@ static esp_err_t send_head(httpd_req_t *req)
 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
 "<title>OpenVent</title>"
 "<style>"
+":root{--code-bg:#f4f4f4;--code-fg:#222}"
 "body{font-family:sans-serif;max-width:520px;margin:1em auto;padding:0 1em;color:#222}"
 "h1{font-size:1.3em;margin-bottom:.2em}"
 "h2{font-size:1.05em;margin-top:1.6em;border-bottom:1px solid #ddd;padding-bottom:.2em}"
@@ -166,6 +167,13 @@ static esp_err_t send_head(httpd_req_t *req)
 ".radios label{display:inline-block;margin-right:1em;font-size:1em;color:#222}"
 ".radios input{width:auto;margin-right:.3em}"
 ".hint{color:#666;font-size:.85em;margin-top:.2em}"
+"code,pre{background:var(--code-bg);color:var(--code-fg);border-radius:3px}"
+"code{padding:.1em .3em}"
+"pre{padding:.6em;overflow-x:auto;font-size:.9em;margin:.4em 0}"
+// Show-password toggle used on the WiFi and AP-config password fields.
+// Wraps input+button in a flex row so the eye button hugs the right edge.
+".pwd{display:flex;gap:.4em}.pwd input{flex:1}"
+".pwd button{width:auto;padding:.55em .9em;margin-top:0;background:#eee;color:#222}"
 // Tab nav. CSS-only: sections default hidden, :target shows one, #home is
 // shown by default and hidden if any earlier sibling is :target.
 "nav.tabs{display:flex;gap:.2em;border-bottom:1px solid #ddd;margin:1em 0}"
@@ -177,6 +185,7 @@ static esp_err_t send_head(httpd_req_t *req)
 // nothing extra for the user to persist. Everything's on --prefixed CSS
 // variables to keep the light-mode rules above untouched.
 "@media(prefers-color-scheme:dark){"
+  ":root{--code-bg:#1c1c1c;--code-fg:#e6e6e6}"
   "body{background:#111;color:#e6e6e6}"
   "h2{border-bottom-color:#333}"
   "label,.radios label{color:#aaa}"
@@ -185,10 +194,10 @@ static esp_err_t send_head(httpd_req_t *req)
   "button{background:#444;color:#fff}"
   "button.secondary{background:#2a2a2a;color:#e6e6e6}"
   ".status{background:#1c1c1c}"
+  ".pwd button{background:#2a2a2a;color:#e6e6e6}"
   "nav.tabs{border-bottom-color:#333}"
   "nav.tabs a{color:#aaa}"
   "nav.tabs a:hover{background:#1c1c1c;color:#fff}"
-  "code{background:#1c1c1c;padding:.1em .3em;border-radius:3px}"
 "}"
 "</style></head><body>"
 "<h1>OpenVent</h1>"
@@ -297,7 +306,7 @@ static esp_err_t send_wifi_section(httpd_req_t *req)
     }
 
     // Manual entry + password + save. Scan status hint.
-    char tail[512];
+    char tail[900];
     const char *scan_hint = pv_wifi_is_scanning()
         ? "<div class=\"hint\">Scanning…</div>"
         : (n == 0
@@ -309,7 +318,12 @@ static esp_err_t send_wifi_section(httpd_req_t *req)
         "<label>Or enter SSID manually (used if dropdown left blank)</label>"
         "<input name=\"ssid_manual\" maxlength=\"32\" autocomplete=\"off\">"
         "<label>Password</label>"
-        "<input name=\"password\" type=\"password\" maxlength=\"64\" autocomplete=\"off\">"
+        "<div class=\"pwd\">"
+          "<input name=\"password\" type=\"password\" maxlength=\"64\" autocomplete=\"off\">"
+          "<button type=\"button\" onclick=\"var i=this.previousElementSibling;"
+            "var s=i.type=='password';i.type=s?'text':'password';"
+            "this.textContent=s?'Hide':'Show'\">Show</button>"
+        "</div>"
         "<button>Save WiFi &amp; reboot</button>"
         "</form>"
         "<form method=\"POST\" action=\"/scan\">"
@@ -388,8 +402,7 @@ static esp_err_t send_policy_section(httpd_req_t *req)
           "<b>To report material to OpenVent</b>, add this to your Klipper "
           "<code>PRINT_START</code> macro so it fires at the start of every print:"
         "</div>"
-        "<pre style=\"background:var(--code-bg,#f4f4f4);padding:.6em;border-radius:.3em;"
-          "overflow-x:auto;font-size:.9em\">"
+        "<pre>"
           "SAVE_VARIABLE VARIABLE=material VALUE='\"{material}\"'"
         "</pre>"
         "<div class=\"hint\">"
@@ -448,7 +461,7 @@ static esp_err_t send_ap_section(httpd_req_t *req)
     html_escape(ap.ssid,     ssid_esc, sizeof(ssid_esc));
     html_escape(ap.password, pass_esc, sizeof(pass_esc));
 
-    char buf[1200];
+    char buf[1600];
     snprintf(buf, sizeof(buf),
         "<h2>AP Hotspot</h2>"
         "<form method=\"POST\" action=\"/ap_config\">"
@@ -460,7 +473,12 @@ static esp_err_t send_ap_section(httpd_req_t *req)
         "<div class=\"hint\">If unchecked, the device won't expose an AP even when it can't reach your WiFi. If you lose WiFi you'll need serial access or a BOOT-button factory reset to recover.</div>"
         "<label>SSID</label><input name=\"ap_ssid\" value=\"%s\" maxlength=\"32\">"
         "<label>Password (blank = keep, min 8 chars for WPA2)</label>"
-        "<input name=\"ap_password\" value=\"%s\" maxlength=\"63\">"
+        "<div class=\"pwd\">"
+          "<input name=\"ap_password\" type=\"password\" value=\"%s\" maxlength=\"63\">"
+          "<button type=\"button\" onclick=\"var i=this.previousElementSibling;"
+            "var s=i.type=='password';i.type=s?'text':'password';"
+            "this.textContent=s?'Hide':'Show'\">Show</button>"
+        "</div>"
         "<label>IP address</label>"
         "<input name=\"ap_ip\" value=\"%u.%u.%u.%u\" maxlength=\"15\">"
         "<button>Save AP &amp; reboot</button>"
